@@ -208,6 +208,11 @@ def start_scheduler() -> None:
         logger.info("调度器已禁用 (SCHEDULER_ENABLED=false)")
         return
 
+    # 启动健康检查 HTTP 服务（供 Zeabur 探活 + 状态页）
+    from .health_server import start_health_server
+
+    start_health_server(port=8080)
+
     scheduler = build_scheduler()
     logger.info(
         f"调度器启动，时区 {TIMEZONE}，已注册 {len(scheduler.get_jobs())} 个任务:"

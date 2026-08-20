@@ -57,6 +57,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["scheduler"]
 
-# 健康检查：检查调度器进程是否在运行
-HEALTHCHECK --interval=5m --timeout=10s --start-period=60s --retries=3 \
-    CMD pgrep -f "apscheduler" > /dev/null || exit 1
+# 健康检查：HTTP 探活（Zeabur 兼容）
+HEALTHCHECK --interval=2m --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# 暴露端口
+EXPOSE 8080
