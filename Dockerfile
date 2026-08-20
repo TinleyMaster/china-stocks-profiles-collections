@@ -19,11 +19,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 运行时依赖：libpq 是 psycopg2 需要的
+# 运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 从构建阶段拷贝已安装的包
 COPY --from=builder /install /usr/local
@@ -36,7 +41,6 @@ RUN mkdir -p logs data/docs
 
 # 环境变量默认值（Zeabur 上会被覆盖）
 ENV PYTHONUNBUFFERED=1
-ENV TZ=Asia/Shanghai
 ENV DB_HOST=localhost
 ENV DB_PORT=5432
 ENV DB_NAME=china_stocks
@@ -46,9 +50,13 @@ ENV SCHEDULER_ENABLED=true
 ENV TIMEZONE=Asia/Shanghai
 ENV MAX_WORKERS=4
 
-# 启动入口：先 init-db 再启动调度器
-ENTRYPOINT ["bash", "-c", "python -m china_stocks init-db && python -m china_stocks scheduler"]
+# 启动脚本
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# 健康检查（每 5 分钟看一下主进程是否还活着）
-HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "from china_stocks.db import get_engine; get_engine().connect().close()" || exit 1
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["scheduler"]
+
+# 健康检查：检查调度器进程是否在运行
+HEALTHCHECK --interval=5m --timeout=10s --start-period=60s --retries=3 \
+    CMD pgrep -f "apscheduler" > /dev/null || exit 1
