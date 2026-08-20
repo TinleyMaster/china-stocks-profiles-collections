@@ -1,0 +1,292 @@
+"""
+Phase A：构建股票统一实体
+
+流程：
+  1. 从 akshare 拉取全 A 股列表 → src_akshare.stock_list
+  2. 拉取申万行业分类 → src_akshare.sw_industry
+  3. 合并写入 core.stock（统一实体层）
+
+全量跑一次约 5000+ 只股票，建议每日开盘前跑一次。
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import pandas as pd
+from sqlalchemy import text
+
+from ..config import WATCHLIST_CODES
+from ..db import get_session
+from ..logging_setup import logger
+from ..sys import finish_run, start_run
+from . import akshare_client as ak
+
+
+def _detect_market(code: str) -> str:
+    """根据 6 位股票代码判断交易所。"""
+    if code.startswith(("60", "68", "90")):
+        return "SH"
+    if code.startswith(("00", "30", "20")):
+        return "SZ"
+    if code.startswith(("43", "83", "87", "88")):
+        return "BJ"
+    return "UNKNOWN"
+
+
+def fetch_stock_list() -> pd.DataFrame:
+    """获取全 A 股列表（带代码、名称、交易所）。"""
+    # 用东方财富的全 A 股实时行情接口，代码名称最全
+    df = ak.call_api("stock_zh_a_spot_em", save_raw=True)
+    # 字段：序号、代码、名称、最新价... 只取代码和名称
+    if "代码" not in df.columns or "名称" not in df.columns:
+        raise RuntimeError("stock_zh_a_spot_em 返回字段不符合预期")
+
+    out = pd.DataFrame()
+    out["stock_code"] = df["代码"].astype(str).str.zfill(6)
+    out["stock_name"] = df["名称"].astype(str)
+    out["market"] = out["stock_code"].apply(_detect_market)
+    out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+    logger.info(f"获取到 {len(out)} 只 A 股")
+    return out
+
+
+def save_stock_list_to_src(df: pd.DataFrame) -> int:
+    """写入 src_akshare.stock_list（先清空再写入快照）。"""
+    with get_session() as sess:
+        sess.execute(text("TRUNCATE TABLE src_akshare.stock_list"))
+        rows = [
+            {
+                "code": r.stock_code,
+                "name": r.stock_name,
+                "market": r.market,
+            }
+            for r in df.itertuples(index=False)
+        ]
+        sess.execute(
+            text("""
+                INSERT INTO src_akshare.stock_list (stock_code, stock_name, market)
+                VALUES (:code, :name, :market)
+            """),
+            rows,
+        )
+    logger.info(f"src_akshare.stock_list 写入 {len(rows)} 行")
+    return len(rows)
+
+
+def fetch_sw_industry() -> pd.DataFrame:
+    """获取申万行业分类（新版接口）。"""
+    try:
+        df = ak.call_api("sw_index_first_info", save_raw=True)
+        # 尝试不同的 akshare 接口名（版本差异大，兼容）
+    except Exception:
+        # 兜底：从行业成分股接口逐个拼
+        logger.warning("sw_index_first_info 调用失败，尝试用 stock_board_industry_name_em 兜底")
+        df = ak.call_api("stock_board_industry_name_em", save_raw=False)
+
+    # 字段名因 akshare 版本差异很大，尝试匹配常见命名
+    col_map = _find_columns(df.columns.tolist(), {
+        "code": ["代码", "股票代码", "stock_code"],
+        "name": ["名称", "股票名称", "stock_name"],
+        "l1": ["申万一级", "一级行业", "行业", "板块名称", "行业名称"],
+        "l2": ["申万二级", "二级行业"],
+        "l3": ["申万三级", "三级行业"],
+    })
+
+    out = pd.DataFrame()
+    out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6) if col_map.get("code") else ""
+    out["stock_name"] = df[col_map["name"]].astype(str) if col_map.get("name") else ""
+    out["industry_l1"] = df[col_map["l1"]].astype(str) if col_map.get("l1") else ""
+    out["industry_l2"] = df[col_map["l2"]].astype(str) if col_map.get("l2") else None
+    out["industry_l3"] = df[col_map["l3"]].astype(str) if col_map.get("l3") else None
+    return out
+
+
+def _find_columns(columns: list[str], mapping: dict[str, list[str]]) -> dict[str, str]:
+    """在 columns 中查找映射字段，返回 {逻辑字段: 实际列名}。"""
+    result = {}
+    lower_cols = {c.lower(): c for c in columns}
+    for logical, candidates in mapping.items():
+        for cand in candidates:
+            if cand in columns:
+                result[logical] = cand
+                break
+            if cand.lower() in lower_cols:
+                result[logical] = lower_cols[cand.lower()]
+                break
+    return result
+
+
+def save_sw_industry_to_src(df: pd.DataFrame) -> int:
+    """写入申万行业快照。"""
+    with get_session() as sess:
+        sess.execute(text("TRUNCATE TABLE src_akshare.sw_industry"))
+        rows = df.to_dict(orient="records")
+        if not rows:
+            return 0
+        sess.execute(
+            text("""
+                INSERT INTO src_akshare.sw_industry
+                    (stock_code, stock_name, industry_l1, industry_l2, industry_l3)
+                VALUES
+                    (:stock_code, :stock_name, :industry_l1, :industry_l2, :industry_l3)
+            """),
+            rows,
+        )
+    logger.info(f"src_akshare.sw_industry 写入 {len(rows)} 行")
+    return len(rows)
+
+
+def refresh_core_stock() -> tuple[int, int]:
+    """
+    以 src 层为数据源，刷新 core.stock 统一实体表。
+    返回 (inserted, updated)。
+    """
+    with get_session() as sess:
+        # 1. 合并 stock_list + sw_industry
+        rows = sess.execute(text("""
+            SELECT
+                sl.stock_code,
+                sl.stock_name,
+                sl.market,
+                sw.industry_l1,
+                sw.industry_l2,
+                sw.industry_l3
+            FROM src_akshare.stock_list sl
+            LEFT JOIN src_akshare.sw_industry sw
+                ON sl.stock_code = sw.stock_code
+        """)).fetchall()
+
+        inserted = 0
+        updated = 0
+        for row in rows:
+            code = row.stock_code
+            # 判断是否 ST
+            is_st = "ST" in row.stock_name or "*ST" in row.stock_name
+            full_code = f"{row.market}{code}"
+
+            existing = sess.execute(
+                text("SELECT 1 FROM core.stock WHERE stock_code = :c"),
+                {"c": code},
+            ).fetchone()
+
+            if existing:
+                sess.execute(
+                    text("""
+                        UPDATE core.stock SET
+                            stock_name = :name,
+                            market = :market,
+                            full_code = :full,
+                            primary_industry_l1 = COALESCE(:l1, primary_industry_l1),
+                            primary_industry_l2 = COALESCE(:l2, primary_industry_l2),
+                            primary_industry_l3 = COALESCE(:l3, primary_industry_l3),
+                            is_st = :is_st,
+                            updated_at = NOW()
+                        WHERE stock_code = :code
+                    """),
+                    {
+                        "code": code,
+                        "name": row.stock_name,
+                        "market": row.market,
+                        "full": full_code,
+                        "l1": row.industry_l1,
+                        "l2": row.industry_l2,
+                        "l3": row.industry_l3,
+                        "is_st": is_st,
+                    },
+                )
+                updated += 1
+            else:
+                sess.execute(
+                    text("""
+                        INSERT INTO core.stock
+                            (stock_code, stock_name, market, full_code,
+                             primary_industry_l1, primary_industry_l2, primary_industry_l3,
+                             is_st, is_delisted)
+                        VALUES
+                            (:code, :name, :market, :full, :l1, :l2, :l3, :is_st, FALSE)
+                    """),
+                    {
+                        "code": code,
+                        "name": row.stock_name,
+                        "market": row.market,
+                        "full": full_code,
+                        "l1": row.industry_l1,
+                        "l2": row.industry_l2,
+                        "l3": row.industry_l3,
+                        "is_st": is_st,
+                    },
+                )
+                inserted += 1
+
+        # 2. 同步 core.stock_source_map（akshare 平台）
+        sess.execute(
+            text("""
+                INSERT INTO core.stock_source_map (stock_code, platform_code, source_id, source_name)
+                SELECT stock_code, 'akshare', stock_code, stock_name
+                FROM core.stock
+                ON CONFLICT (stock_code, platform_code) DO UPDATE
+                    SET source_id = EXCLUDED.source_id,
+                        source_name = EXCLUDED.source_name
+            """)
+        )
+
+    logger.info(f"core.stock 更新完成: 新增 {inserted}, 更新 {updated}")
+    return inserted, updated
+
+
+def get_stock_codes(limit: Optional[int] = None, only_watchlist: bool = False) -> list[str]:
+    """
+    获取需要采集的股票代码列表。
+
+    - 如果配置了 WATCHLIST_CODES 且 only_watchlist=True，则只返回自选股
+    - limit 可选限制数量（用于调试）
+    """
+    if only_watchlist and WATCHLIST_CODES:
+        codes = [c.zfill(6) for c in WATCHLIST_CODES]
+    else:
+        with get_session() as sess:
+            rows = sess.execute(
+                text("SELECT stock_code FROM core.stock WHERE is_delisted = FALSE ORDER BY stock_code")
+            ).fetchall()
+            codes = [r[0] for r in rows]
+
+    if limit and limit > 0:
+        codes = codes[:limit]
+    return codes
+
+
+def run_phase_a() -> None:
+    """完整执行 Phase A。"""
+    run = start_run(platform_code="akshare", phase="phase_a", target="all")
+    try:
+        # 1. 股票列表
+        list_df = fetch_stock_list()
+        list_count = save_stock_list_to_src(list_df)
+
+        # 2. 申万行业（可能接口不稳定，失败不影响主流程）
+        sw_count = 0
+        try:
+            sw_df = fetch_sw_industry()
+            if not sw_df.empty and "stock_code" in sw_df.columns:
+                sw_count = save_sw_industry_to_src(sw_df)
+        except Exception as e:
+            logger.warning(f"申万行业采集失败（将跳过行业字段）: {e}")
+
+        # 3. 刷新 core.stock
+        inserted, updated = refresh_core_stock()
+
+        finish_run(
+            run,
+            status="success",
+            rows_inserted=inserted + list_count + sw_count,
+            rows_updated=updated,
+        )
+        logger.info("Phase A 执行成功")
+    except Exception as e:
+        logger.exception(f"Phase A 执行失败: {e}")
+        finish_run(run, status="failed", error_msg=str(e))
+        raise
+
+
+if __name__ == "__main__":
+    run_phase_a()

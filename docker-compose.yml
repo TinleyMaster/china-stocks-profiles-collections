@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: china_stocks_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: china_stocks
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d china_stocks"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: china_stocks_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: china_stocks
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      SCHEDULER_ENABLED: "true"
+      TIMEZONE: Asia/Shanghai
+      MAX_WORKERS: 4
+      # LLM 配置（可选，取消注释并填值）
+      # LLM_PROVIDER: openai_compatible
+      # LLM_API_KEY: sk-xxx
+      # LLM_BASE_URL: https://api.deepseek.com/v1
+      # LLM_MODEL: deepseek-chat
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+volumes:
+  pg_data:

@@ -1,0 +1,435 @@
+"""
+CLI 入口：python -m china_stocks [command]
+
+命令：
+  init-db        初始化数据库（建 schema + 建表）
+  phase-a        执行 Phase A（股票池构建）
+  phase-daily    执行日线行情采集
+  stock-basic    刷新 stock_basic 估值画像
+  finance        刷新财务指标画像
+  scheduler      启动调度器
+  status         查看最近采集状态
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from .config import db_url
+from .logging_setup import logger
+
+
+def cmd_init_db() -> None:
+    """初始化数据库 schema 和表。"""
+    from pathlib import Path
+
+    sql_path = Path(__file__).resolve().parent.parent / "db" / "init.sql"
+    if not sql_path.exists():
+        logger.error(f"找不到初始化 SQL: {sql_path}")
+        sys.exit(1)
+
+    sql = sql_path.read_text(encoding="utf-8")
+    # 执行前先建 schema
+    from .db import get_engine
+    import sqlalchemy
+
+    schemas = ["sys", "raw", "src_akshare", "core", "biz"]
+    engine = get_engine()
+    with engine.connect() as conn:
+        for schema in schemas:
+            conn.execute(sqlalchemy.text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+        conn.commit()
+
+    # 用 sqlalchemy.text 执行整个 SQL 文件
+    with engine.connect() as conn:
+        conn.execute(sqlalchemy.text(sql))
+        conn.commit()
+
+    logger.info(f"数据库初始化完成: {db_url()}")
+
+
+def cmd_phase_a() -> None:
+    from .src.phase_a_stock_pool import run_phase_a
+
+    run_phase_a()
+
+
+def cmd_phase_daily(args) -> None:
+    from .src.phase_b_daily import run_phase_daily, fetch_daily
+    from .src.phase_a_stock_pool import get_stock_codes
+
+    if args.limit or args.codes:
+        codes = args.codes.split(",") if args.codes else None
+        if args.limit:
+            if not codes:
+                codes = get_stock_codes(limit=args.limit)
+            else:
+                codes = codes[: args.limit]
+        fetch_daily(stock_codes=codes, incremental=not args.full)
+    else:
+        run_phase_daily()
+
+
+def cmd_stock_basic() -> None:
+    from .biz.stock_basic import run_stock_basic
+
+    run_stock_basic()
+
+
+def cmd_finance() -> None:
+    from .biz.finance_snapshot import run_finance_snapshot
+
+    run_finance_snapshot()
+
+
+def cmd_capital() -> None:
+    from .biz.capital_snapshot import run_capital_snapshot
+
+    run_capital_snapshot()
+
+
+def cmd_announcements(args) -> None:
+    from .src.phase_b2_announcements import run_phase_b2_announcements
+
+    run_phase_b2_announcements(
+        incremental=not args.full,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+
+def cmd_download_announcements(args) -> None:
+    from .src.phase_b2_download import run_download_announcements
+
+    codes = args.codes.split(",") if args.codes else None
+    dtypes = args.types.split(",") if args.types else None
+    run_download_announcements(
+        stock_codes=codes,
+        limit=args.limit,
+        doc_types=dtypes,
+    )
+
+
+def cmd_research(args) -> None:
+    from .src.phase_b3_research import run_phase_b3_research
+
+    run_phase_b3_research(
+        incremental=not args.full,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+
+def cmd_survey(args) -> None:
+    from .src.phase_b3_survey import run_phase_b3_survey
+
+    run_phase_b3_survey(
+        incremental=not args.full,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+
+def cmd_download_docs(args) -> None:
+    from .src.phase_b2_download import download_docs
+    from .sys import finish_run, start_run
+
+    codes = args.codes.split(",") if args.codes else None
+    dtypes = args.types.split(",") if args.types else None
+    plats = args.platforms.split(",") if args.platforms else None
+
+    run = start_run(
+        platform_code="multi",
+        phase="phase_b_download",
+        target=f"limit={args.limit}, types={dtypes}, platforms={plats}",
+    )
+    try:
+        success, failed = download_docs(
+            stock_codes=codes,
+            limit=args.limit,
+            doc_types=dtypes,
+            source_platforms=plats,
+        )
+        finish_run(run, status="success", rows_inserted=success, rows_updated=failed)
+    except Exception as e:
+        from .logging_setup import logger
+
+        logger.exception(f"文档下载失败: {e}")
+        finish_run(run, status="failed", error_msg=str(e))
+        raise
+
+
+def cmd_shareholder() -> None:
+    from .biz.shareholder_snapshot import run_shareholder_snapshot
+
+    run_shareholder_snapshot()
+
+
+def cmd_notebook_build(args) -> None:
+    from .biz.research_notebook import run_build_notebooks, build_notebook_for_stock
+
+    if args.code:
+        result = build_notebook_for_stock(args.code.zfill(6))
+        print(f"已刷新: {result['stock_name']}（{result['stock_code']}）")
+        print(f"完整度得分: {result['completeness_score']}/100")
+        print(f"文档: {result['total_docs']} 条 (已下载 {result['downloaded_docs']})")
+        print(f"事件: {result['total_events']} 条")
+    else:
+        run_build_notebooks(limit=args.limit or 0)
+
+
+def cmd_notebook_info(args) -> None:
+    from .biz.research_notebook import get_notebook_summary
+
+    code = args.code.zfill(6)
+    nb = get_notebook_summary(code)
+    if not nb:
+        print(f"未找到 {code} 的笔记本，请先运行 notebook-build")
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"  {nb['stock_name']}（{nb['stock_code']}）")
+    print(f"  行业: {nb['industry_l1']} / {nb['industry_l2']}")
+    print(f"  完整度: {nb['completeness_score']}/100")
+    print(f"  文档总数: {nb['total_docs']} (已下载 {nb['downloaded_docs']})")
+    print(f"  事件总数: {nb['total_events']}")
+    print(f"  最新财报期: {nb['latest_report_date']}")
+    if nb["rating"]:
+        print(f"  自评级: {nb['rating']}")
+    print(f"{'=' * 60}")
+
+    # 分类展示完整性
+    c = nb.get("completeness", {})
+    categories = {}
+    for key, item in c.items():
+        cat = item.get("category", "其他")
+        categories.setdefault(cat, []).append(item)
+
+    for cat, items in sorted(categories.items()):
+        done = sum(1 for i in items if i["status"] == "done")
+        print(f"\n【{cat}】({done}/{len(items)})")
+        for item in sorted(items, key=lambda x: x["status"]):
+            icon = (
+                "✅"
+                if item["status"] == "done"
+                else "🟡"
+                if item["status"] == "partial"
+                else "❌"
+            )
+            print(
+                f"  {icon} {item['label']}: {item['count']} (阈值 {item['threshold']})"
+            )
+
+    print()
+
+
+def cmd_notebook_missing(args) -> None:
+    from .biz.research_notebook import list_missing_items
+
+    code = args.code.zfill(6)
+    items = list_missing_items(code)
+    if not items:
+        print("资料齐全，没有缺失项 ✅")
+        return
+
+    print(f"\n缺失/不足的资料项 ({len(items)} 项):")
+    for i, item in enumerate(items, 1):
+        print(
+            f"  {i}. [{item['category']}] {item['label']} ({item['key']}) — "
+            f"当前 {item['count']}, 阈值 {item['threshold']}, 状态: {item['status']}"
+        )
+    print()
+
+
+def cmd_notebook_fill(args) -> None:
+    from .biz.notebook_fill import run_fill_notebook
+
+    items = args.items.split(",") if args.items else None
+    run_fill_notebook(args.code.zfill(6), items=items)
+
+
+def cmd_ask(args) -> None:
+    from .biz.rag import ask_stock
+
+    code = args.code.zfill(6)
+    result = ask_stock(code, args.question, save_to_history=not args.no_save)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Q: {args.question}")
+    print(f"  股票: {code}  |  模型: {result['model']}")
+    print(f"{'=' * 60}\n")
+    print(result["answer"])
+
+    if result["sources"]:
+        print(f"\n引用来源 ({len(result['sources'])}):")
+        for i, s in enumerate(result["sources"], 1):
+            print(f"  [{i}] {s['title']}")
+            print(f"      {s['doc_type']} · {s['publish_date']} · {s['source']}")
+            if s.get("url"):
+                print(f"      {s['url']}")
+    print()
+
+
+def cmd_events() -> None:
+    from .src.phase_d_events import run_corporate_events
+
+    run_corporate_events()
+
+
+def cmd_scheduler() -> None:
+    from .scheduler import start_scheduler
+
+    start_scheduler()
+
+
+def cmd_status(_args) -> None:
+    """查看最近 10 条采集记录。"""
+    from sqlalchemy import text
+    from .db import get_session
+
+    with get_session() as sess:
+        rows = sess.execute(
+            text("""
+            SELECT run_id, phase, status, rows_inserted, rows_updated,
+                   started_at, cost_seconds, error_msg
+            FROM sys.ingest_run
+            ORDER BY run_id DESC
+            LIMIT 10
+        """)
+        ).fetchall()
+
+    if not rows:
+        print("暂无采集记录")
+        return
+
+    print(
+        f"{'ID':<6}{'Phase':<24}{'Status':<10}{'Ins':>6}{'Upd':>6}  "
+        f"{'Started At':<22}{'Cost(s)':>8}"
+    )
+    print("-" * 90)
+    for r in rows:
+        cost = f"{r.cost_seconds:.1f}" if r.cost_seconds else "-"
+        started = r.started_at.strftime("%Y-%m-%d %H:%M:%S") if r.started_at else "-"
+        print(
+            f"{r.run_id:<6}{r.phase:<24}{r.status:<10}{r.rows_inserted or 0:>6}"
+            f"{r.rows_updated or 0:>6}  {started:<22}{cost:>8}"
+        )
+        if r.error_msg:
+            print(f"       error: {r.error_msg[:100]}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="china_stocks", description="A 股投研资料采集系统"
+    )
+    sub = parser.add_subparsers(dest="command", help="可用命令")
+
+    sub.add_parser("init-db", help="初始化数据库")
+    sub.add_parser("phase-a", help="Phase A: 股票池构建")
+
+    p_daily = sub.add_parser("phase-daily", help="日线行情采集")
+    p_daily.add_argument("--codes", type=str, help="指定股票代码，逗号分隔")
+    p_daily.add_argument("--limit", type=int, help="限制数量（调试用）")
+    p_daily.add_argument("--full", action="store_true", help="全量重拉（默认增量）")
+
+    sub.add_parser("stock-basic", help="刷新估值画像")
+    sub.add_parser("finance", help="刷新财务指标")
+    sub.add_parser("capital", help="刷新资金面画像（北向+融资融券）")
+    sub.add_parser("shareholder", help="刷新股东画像（十大股东+质押+户数）")
+    sub.add_parser("events", help="采集公司事件（分红/解禁/业绩预告/回购/增减持）")
+
+    p_ann = sub.add_parser("announcements", help="公告入口采集（巨潮资讯网）")
+    p_ann.add_argument("--start", type=str, help="起始日期 YYYYMMDD")
+    p_ann.add_argument("--end", type=str, help="结束日期 YYYYMMDD")
+    p_ann.add_argument("--full", action="store_true", help="非增量（从指定日期开始）")
+
+    p_research = sub.add_parser("research", help="券商研报入口采集（东财研报中心）")
+    p_research.add_argument("--start", type=str, help="起始日期 YYYYMMDD")
+    p_research.add_argument("--end", type=str, help="结束日期 YYYYMMDD")
+    p_research.add_argument(
+        "--full", action="store_true", help="非增量（从指定日期开始）"
+    )
+
+    p_survey = sub.add_parser("survey", help="机构调研纪要采集（东财）")
+    p_survey.add_argument("--start", type=str, help="起始日期 YYYYMMDD")
+    p_survey.add_argument("--end", type=str, help="结束日期 YYYYMMDD")
+    p_survey.add_argument(
+        "--full", action="store_true", help="非增量（从指定日期开始）"
+    )
+
+    p_dl = sub.add_parser("download-docs", help="下载文档 PDF 到本地（公告/研报/调研）")
+    p_dl.add_argument("--codes", type=str, help="指定股票代码，逗号分隔")
+    p_dl.add_argument("--limit", type=int, help="限制下载数量")
+    p_dl.add_argument(
+        "--types",
+        type=str,
+        help="指定文档类型（announcement/research/survey...），逗号分隔",
+    )
+    p_dl.add_argument(
+        "--platforms",
+        type=str,
+        help="指定来源平台（cninfo/eastmoney_research...），逗号分隔",
+    )
+
+    # 兼容旧命令
+    p_dl_old = sub.add_parser("download-ann", help="（兼容）下载公告 PDF 到本地")
+    p_dl_old.add_argument("--codes", type=str, help="指定股票代码，逗号分隔")
+    p_dl_old.add_argument("--limit", type=int, help="限制下载数量")
+    p_dl_old.add_argument("--types", type=str, help="指定公告类型，逗号分隔")
+
+    sub.add_parser("scheduler", help="启动调度器")
+    sub.add_parser("status", help="查看采集状态")
+
+    # ── Phase D: 投研笔记本 ──
+    nb = sub.add_parser("notebook-build", help="构建/刷新投研笔记本（完整性清单）")
+    nb.add_argument("--limit", type=int, help="限制数量（调试用）")
+    nb.add_argument("--code", type=str, help="单只股票代码")
+
+    nb_info = sub.add_parser("notebook-info", help="查看某只股票的笔记本概览")
+    nb_info.add_argument("code", type=str, help="股票代码")
+
+    nb_missing = sub.add_parser("notebook-missing", help="列出缺失资料")
+    nb_missing.add_argument("code", type=str, help="股票代码")
+
+    nb_fill = sub.add_parser("notebook-fill", help="一键补齐缺失资料")
+    nb_fill.add_argument("code", type=str, help="股票代码")
+    nb_fill.add_argument("--items", type=str, help="指定补齐项，逗号分隔")
+
+    ask = sub.add_parser("ask", help="对某只股票提问（RAG 问答）")
+    ask.add_argument("code", type=str, help="股票代码")
+    ask.add_argument("question", type=str, help="问题")
+    ask.add_argument("--no-save", action="store_true", help="不保存对话历史")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    dispatch = {
+        "init-db": lambda _: cmd_init_db(),
+        "phase-a": lambda _: cmd_phase_a(),
+        "phase-daily": cmd_phase_daily,
+        "stock-basic": lambda _: cmd_stock_basic(),
+        "finance": lambda _: cmd_finance(),
+        "capital": lambda _: cmd_capital(),
+        "shareholder": lambda _: cmd_shareholder(),
+        "events": lambda _: cmd_events(),
+        "announcements": cmd_announcements,
+        "research": cmd_research,
+        "survey": cmd_survey,
+        "download-docs": cmd_download_docs,
+        "download-ann": cmd_download_announcements,
+        "scheduler": lambda _: cmd_scheduler(),
+        "status": cmd_status,
+        "notebook-build": cmd_notebook_build,
+        "notebook-info": cmd_notebook_info,
+        "notebook-missing": cmd_notebook_missing,
+        "notebook-fill": cmd_notebook_fill,
+        "ask": cmd_ask,
+    }
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

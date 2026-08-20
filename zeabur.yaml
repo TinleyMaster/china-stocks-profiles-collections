@@ -1,0 +1,43 @@
+apiVersion: zeabur.com/v1
+kind: Service
+metadata:
+  name: china-stocks
+spec:
+  type: docker
+  docker:
+    dockerfile: Dockerfile
+  env:
+    - key: DB_HOST
+      description: PostgreSQL 主机地址（Zeabur 上选择已部署的 PG 服务）
+    - key: DB_PORT
+      default: "5432"
+    - key: DB_NAME
+      default: china_stocks
+    - key: DB_USER
+      default: postgres
+    - key: DB_PASSWORD
+      description: 数据库密码（Secret）
+      secret: true
+    - key: SCHEDULER_ENABLED
+      default: "true"
+    - key: TIMEZONE
+      default: Asia/Shanghai
+    - key: MAX_WORKERS
+      default: "4"
+    - key: LLM_PROVIDER
+      default: mock
+      description: LLM 提供商（mock / openai_compatible）
+    - key: LLM_API_KEY
+      description: LLM API Key（Secret）
+      secret: true
+    - key: LLM_BASE_URL
+      description: LLM Base URL
+    - key: LLM_MODEL
+      description: LLM 模型名
+  volumes:
+    - id: data
+      mountPath: /app/data
+      size: 1GB
+    - id: logs
+      mountPath: /app/logs
+      size: 512MB
