@@ -235,6 +235,50 @@ python -m china_stocks scheduler
 
 配置了 SMTP 的话，任务失败会自动发邮件告警。
 
+## Docker 部署
+
+### 本地 docker-compose（推荐测试用）
+
+```bash
+# 启动（PostgreSQL + 应用）
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f app
+
+# 停止
+docker-compose down
+```
+
+数据持久化：
+- PostgreSQL 数据：Docker volume `pg_data`
+- 文档 PDF：`./data/`
+- 日志：`./logs/`
+
+### Zeabur 一键部署
+
+项目已包含 `zeabur.yaml` 和 `Dockerfile`，支持 Zeabur 直接部署。
+
+步骤：
+
+1. **新建 PostgreSQL 服务**：在 Zeabur 控制台添加 PostgreSQL 服务，记下连接信息
+2. **部署应用**：从 GitHub 仓库导入，Zeabur 会自动识别 `Dockerfile`
+3. **配置环境变量**：
+   - `DB_HOST`：PostgreSQL 服务的内部域名
+   - `DB_PORT`：5432
+   - `DB_NAME`：数据库名
+   - `DB_USER`：用户名
+   - `DB_PASSWORD`：密码（设为 Secret）
+   - `SCHEDULER_ENABLED`：`true`
+   - `TIMEZONE`：`Asia/Shanghai`
+   - `MAX_WORKERS`：`4`（根据机器规格调整）
+4. **存储卷**：挂两个卷
+   - `/app/data`（1GB，存下载的 PDF）
+   - `/app/logs`（512MB，存日志）
+5. **重启应用**：首次启动会自动执行 `init-db` 初始化表结构
+
+> 注意：akshare 的部分接口需要访问国内网站，建议选择 Zeabur 的国内/香港节点以提高采集速度。
+
 ## 设计要点
 
 ### 为什么不用 n8n？
