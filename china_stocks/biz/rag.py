@@ -2,20 +2,17 @@
 RAG 检索器 + 问答流程。
 
 两级检索策略（对齐 crypto 项目的"严格依据资料库回答，强制 [编号] 标注来源"）：
-  1. 关键词检索 — 用 PostgreSQL 全文搜索/ILIKE，从 doc_chunk 或 doc_source_entry 标题中搜
-  2. 向量检索 — 用 pgvector 相似度搜索（需已向量化）
+  1. 标题检索 — 从 doc_source_entry 按标题 ILIKE 匹配，适合找特定公告/研报
+  2. 正文块检索 — 从 doc_chunk 按关键词检索正文内容，适合找具体数据/论点
+  3. 向量检索（可选）— 用 pgvector 相似度搜索（需已向量化 + pgvector 扩展）
 
-目前先实现"标题级 + 结构化数据"的检索：
-  - 从 biz.doc_source_entry 按标题 + content_topics 检索文档
-  - 从 biz.corporate_event 检索事件
-  - 从 biz.stock_basic / finance_snapshot / capital_snapshot 取画像数据（作为 context）
-
-未来可以扩展到正文级的向量检索（需要先做文档解析 + 切块 + 向量化）。
+召回后按相关性融合排序，取 top N 作为 context。
 """
+
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy import text
@@ -27,15 +24,18 @@ from .llm_client import chat_completion, is_available
 
 @dataclass
 class RetrievedDoc:
-    """检索到的文档片段。"""
+    """检索到的文档片段（可以是标题级或正文块级）。"""
+
     doc_id: int
     title: str
     source_platform: str
     doc_type: str
     publish_date: Optional[str]
     url: str
-    snippet: str = ""
-    score: float = 0.0
+    snippet: str = ""  # 展示用的片段（正文或标题）
+    score: float = 0.0  # 相关性得分 0~1
+    chunk_id: Optional[int] = None  # 正文块时的 chunk id
+    chunk_index: Optional[int] = None  # 块序号
 
     def to_dict(self) -> dict:
         return {
@@ -47,6 +47,8 @@ class RetrievedDoc:
             "url": self.url,
             "snippet": self.snippet,
             "score": round(self.score, 3),
+            "chunk_id": self.chunk_id,
+            "chunk_index": self.chunk_index,
         }
 
 
@@ -57,8 +59,8 @@ def keyword_search_docs(
     limit: int = 20,
 ) -> list[RetrievedDoc]:
     """
-    按关键词在文档标题中检索。
-    用 ILIKE 做简单匹配，排序按发布日期倒序。
+    按关键词在文档标题中检索（标题级召回）。
+    用 ILIKE 做简单匹配，按发布日期倒序 + 关键词命中数排序。
     """
     keywords = [kw.strip() for kw in query.split() if kw.strip()]
     if not keywords:
@@ -71,7 +73,7 @@ def keyword_search_docs(
     """
     params: dict = {"code": stock_code, "limit": limit}
 
-    # 每个关键词做 ILIKE 匹配，全部命中
+    # 每个关键词做 ILIKE 匹配
     for i, kw in enumerate(keywords):
         sql += f" AND title ILIKE :kw{i}"
         params[f"kw{i}"] = f"%{kw}%"
@@ -87,20 +89,145 @@ def keyword_search_docs(
 
     results = []
     for r in rows:
-        # 简单的相关性得分：标题越短、关键词越靠前得分越高
-        score = min(1.0, len(keywords) * 0.3)
-        results.append(RetrievedDoc(
-            doc_id=r.id,
+        # 标题级得分：关键词全部命中给较高基础分
+        score = min(0.7, 0.3 + len(keywords) * 0.1)
+        results.append(
+            RetrievedDoc(
+                doc_id=r.id,
+                title=r.title,
+                source_platform=r.source_platform,
+                doc_type=r.doc_type,
+                publish_date=str(r.publish_date) if r.publish_date else None,
+                url=r.url or "",
+                snippet=r.title,
+                score=score,
+            )
+        )
+
+    return results
+
+
+def keyword_search_chunks(
+    stock_code: str,
+    query: str,
+    doc_types: Optional[list[str]] = None,
+    limit: int = 20,
+) -> list[RetrievedDoc]:
+    """
+    按关键词在正文块中检索（正文级召回，BM25 风格的简单打分）。
+
+    打分策略：
+      - 命中关键词数越多得分越高
+      - 关键词密度（命中数 / 总词数）越高得分越高
+      - 多个块来自同一篇文档时，只保留得分最高的那个（去重到文档级）
+    """
+    keywords = [kw.strip() for kw in query.split() if kw.strip()]
+    if not keywords:
+        return []
+
+    # 构建 SQL：每个关键词都 ILIKE 匹配 chunk_text，统计命中数
+    sql_parts = [
+        "SELECT c.id AS chunk_id, c.doc_id, c.chunk_index, c.chunk_text, c.chunk_tokens,",
+        "       d.title, d.source_platform, d.doc_type, d.publish_date, d.url",
+        "FROM biz.doc_chunk c",
+        "JOIN biz.doc_source_entry d ON d.id = c.doc_id",
+        "WHERE c.stock_code = :code",
+    ]
+    params: dict = {"code": stock_code, "limit": limit}
+
+    # 统计命中关键词数（每个关键词命中加 1）
+    hit_expr_parts = []
+    for i, kw in enumerate(keywords):
+        hit_expr_parts.append(
+            f"(CASE WHEN c.chunk_text ILIKE :kw{i} THEN 1 ELSE 0 END)"
+        )
+        params[f"kw{i}"] = f"%{kw}%"
+
+    hit_expr = " + ".join(hit_expr_parts) + " AS hit_count"
+    sql_parts.insert(1, hit_expr)
+
+    # 至少命中一个关键词
+    sql_parts.append(f"AND ({' + '.join(hit_expr_parts)}) > 0")
+
+    if doc_types:
+        sql_parts.append("AND d.doc_type = ANY(:dtypes)")
+        params["dtypes"] = doc_types
+
+    sql_parts.append("ORDER BY hit_count DESC, c.chunk_tokens ASC")
+    sql_parts.append("LIMIT :limit")
+
+    sql = "\n".join(sql_parts)
+
+    with get_session() as sess:
+        rows = sess.execute(text(sql), params).fetchall()
+
+    if not rows:
+        return []
+
+    # 计算相关性得分（归一化到 0~1）
+    max_hits = max(r.hit_count for r in rows)
+    results = []
+    seen_docs: dict[int, RetrievedDoc] = {}  # 按 doc_id 去重
+
+    for r in rows:
+        # 得分 = 命中比例 * 0.6 + 密度因子 * 0.4
+        hit_ratio = r.hit_count / len(keywords) if keywords else 0
+        # 密度因子：命中数 / (tokens / 100)，即每百字命中数
+        density = r.hit_count / max(1, (r.chunk_tokens or 500) / 100)
+        density_score = min(1.0, density / 5)  # 每百字命中 5 个就满分
+        score = hit_ratio * 0.6 + density_score * 0.4
+
+        doc = RetrievedDoc(
+            doc_id=r.doc_id,
             title=r.title,
             source_platform=r.source_platform,
             doc_type=r.doc_type,
             publish_date=str(r.publish_date) if r.publish_date else None,
             url=r.url or "",
-            snippet=r.title,  # 暂时用标题当 snippet
+            snippet=_make_snippet(r.chunk_text, keywords),
             score=score,
-        ))
+            chunk_id=r.chunk_id,
+            chunk_index=r.chunk_index,
+        )
 
-    return results
+        # 同文档只保留得分最高的块
+        if r.doc_id not in seen_docs or score > seen_docs[r.doc_id].score:
+            seen_docs[r.doc_id] = doc
+
+    results = sorted(seen_docs.values(), key=lambda x: x.score, reverse=True)
+    return results[:limit]
+
+
+def _make_snippet(text: str, keywords: list[str], max_len: int = 300) -> str:
+    """从正文中提取包含关键词的片段作为 snippet。"""
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+
+    # 找第一个关键词出现的位置
+    pos = -1
+    for kw in keywords:
+        idx = text.lower().find(kw.lower())
+        if idx >= 0 and (pos < 0 or idx < pos):
+            pos = idx
+
+    if pos < 0:
+        return text[:max_len] + "..."
+
+    # 从关键词前后截取
+    half = max_len // 2
+    start = max(0, pos - half)
+    end = min(len(text), start + max_len)
+    if start > 0:
+        start = text.find(" ", start)  # 从空格开始，避免切半字
+        if start < 0:
+            start = 0
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
 
 
 def search_events(
@@ -133,11 +260,14 @@ def search_events(
         ORDER BY event_date DESC LIMIT :limit
     """
     with get_session() as sess:
-        rows = sess.execute(text(sql), {
-            "code": stock_code,
-            "types": matched_types,
-            "limit": limit,
-        }).fetchall()
+        rows = sess.execute(
+            text(sql),
+            {
+                "code": stock_code,
+                "types": matched_types,
+                "limit": limit,
+            },
+        ).fetchall()
 
     return [
         {
@@ -153,22 +283,31 @@ def search_events(
 def get_stock_profile_context(stock_code: str) -> str:
     """获取股票画像文本（作为 RAG context 的一部分）。"""
     with get_session() as sess:
-        basic = sess.execute(text("""
+        basic = sess.execute(
+            text("""
             SELECT stock_name, close, change_pct, total_market_cap, pe_ttm, pb,
                    turnover_rate, as_of_date
             FROM biz.stock_basic WHERE stock_code = :code
-        """), {"code": stock_code}).fetchone()
+        """),
+            {"code": stock_code},
+        ).fetchone()
 
-        finance = sess.execute(text("""
+        finance = sess.execute(
+            text("""
             SELECT report_date, revenue, revenue_yoy, net_profit, net_profit_yoy,
                    roe, gross_margin, net_margin, debt_ratio, eps, bps
             FROM biz.finance_snapshot WHERE stock_code = :code
-        """), {"code": stock_code}).fetchone()
+        """),
+            {"code": stock_code},
+        ).fetchone()
 
-        capital = sess.execute(text("""
+        capital = sess.execute(
+            text("""
             SELECT north_hold_pct, margin_balance
             FROM biz.capital_snapshot WHERE stock_code = :code
-        """), {"code": stock_code}).fetchone()
+        """),
+            {"code": stock_code},
+        ).fetchone()
 
     parts = []
 
@@ -234,13 +373,75 @@ RAG_SYSTEM_PROMPT = """你是一个专业的 A 股投研助手。请严格依据
 """
 
 
-def build_context(stock_code: str, query: str, max_docs: int = 15) -> tuple[str, list[RetrievedDoc], list[dict]]:
+def hybrid_search(
+    stock_code: str,
+    query: str,
+    doc_types: Optional[list[str]] = None,
+    limit: int = 15,
+    title_weight: float = 0.3,
+    chunk_weight: float = 0.7,
+) -> list[RetrievedDoc]:
     """
-    构建 RAG 上下文。
+    混合检索：标题 + 正文块双路召回，融合后排序。
+
+    策略：
+      - 标题召回权重较低（0.3），但标题命中代表主题相关
+      - 正文块召回权重较高（0.7），内容更具体
+      - 同一 doc_id 的结果合并，取较高得分
+    """
+    # 两路召回
+    title_results = keyword_search_docs(
+        stock_code, query, doc_types=doc_types, limit=limit
+    )
+    chunk_results = keyword_search_chunks(
+        stock_code, query, doc_types=doc_types, limit=limit
+    )
+
+    # 融合：按 doc_id 合并
+    merged: dict[int, RetrievedDoc] = {}
+
+    for doc in title_results:
+        doc.score = doc.score * title_weight
+        merged[doc.doc_id] = doc
+
+    for doc in chunk_results:
+        weighted_score = doc.score * chunk_weight
+        if doc.doc_id in merged:
+            # 正文块得分更高，用正文块替换（信息更丰富）
+            if weighted_score > merged[doc.doc_id].score:
+                doc.score = weighted_score + merged[doc.doc_id].score * 0.2  # 标题加分
+                merged[doc.doc_id] = doc
+            else:
+                # 保留标题级，但加上正文命中的加分
+                merged[doc.doc_id].score += weighted_score * 0.3
+        else:
+            doc.score = weighted_score
+            merged[doc.doc_id] = doc
+
+    # 按得分降序，取 top N
+    results = sorted(merged.values(), key=lambda x: x.score, reverse=True)
+    return results[:limit]
+
+
+def build_context(
+    stock_code: str, query: str, max_docs: int = 15
+) -> tuple[str, list[RetrievedDoc], list[dict]]:
+    """
+    构建 RAG 上下文（双路召回版本）。
     返回 (context_text, docs, events)
     """
-    # 1. 文档检索
-    docs = keyword_search_docs(stock_code, query, limit=max_docs)
+    # 1. 混合检索：标题 + 正文块
+    docs = hybrid_search(stock_code, query, limit=max_docs)
+
+    # 如果混合检索结果太少，补充纯标题检索
+    if len(docs) < 5:
+        title_docs = keyword_search_docs(stock_code, query, limit=max_docs)
+        existing_ids = {d.doc_id for d in docs}
+        for d in title_docs:
+            if d.doc_id not in existing_ids:
+                docs.append(d)
+                if len(docs) >= max_docs:
+                    break
 
     # 2. 事件检索
     events = search_events(stock_code, query, limit=5)
@@ -254,12 +455,18 @@ def build_context(stock_code: str, query: str, max_docs: int = 15) -> tuple[str,
     if docs:
         doc_lines = []
         for i, doc in enumerate(docs, 1):
+            chunk_info = (
+                f"（第 {doc.chunk_index} 段）" if doc.chunk_index is not None else ""
+            )
             doc_lines.append(
-                f"[{i}] 标题: {doc.title}\n"
+                f"[{i}] 标题: {doc.title}{chunk_info}\n"
                 f"    类型: {doc.doc_type}  日期: {doc.publish_date}\n"
                 f"    来源: {doc.source_platform}  链接: {doc.url}\n"
+                f"    摘要: {doc.snippet}\n"
             )
-        context_parts.append(f"=== 相关文档 ({len(docs)} 条) ===\n" + "\n".join(doc_lines))
+        context_parts.append(
+            f"=== 相关文档 ({len(docs)} 条) ===\n" + "\n".join(doc_lines)
+        )
 
     if events:
         evt_lines = []
@@ -268,7 +475,9 @@ def build_context(stock_code: str, query: str, max_docs: int = 15) -> tuple[str,
                 f"[E{i}] 类型: {evt['event_type']}  日期: {evt['event_date']}\n"
                 f"     详情: {json.dumps(evt['event_data'], ensure_ascii=False)[:300]}\n"
             )
-        context_parts.append(f"=== 相关事件 ({len(events)} 条) ===\n" + "\n".join(evt_lines))
+        context_parts.append(
+            f"=== 相关事件 ({len(events)} 条) ===\n" + "\n".join(evt_lines)
+        )
 
     return "\n\n".join(context_parts), docs, events
 
@@ -326,31 +535,40 @@ def ask_stock(
     if save_to_history:
         with get_session() as sess:
             # 用户消息
-            sess.execute(text("""
+            sess.execute(
+                text("""
                 INSERT INTO biz.research_message
                     (stock_code, role, content)
                 VALUES (:code, 'user', :content)
-            """), {"code": stock_code, "content": question})
+            """),
+                {"code": stock_code, "content": question},
+            )
 
             # 助手消息（含来源）
             sources_json = json.dumps([d.to_dict() for d in docs], ensure_ascii=False)
-            sess.execute(text("""
+            sess.execute(
+                text("""
                 INSERT INTO biz.research_message
                     (stock_code, role, content, sources, model, tokens_used)
                 VALUES (:code, 'assistant', :content, :sources::jsonb, :model, :tokens)
-            """), {
-                "code": stock_code,
-                "content": answer,
-                "sources": sources_json,
-                "model": model,
-                "tokens": usage.get("total_tokens", 0),
-            })
+            """),
+                {
+                    "code": stock_code,
+                    "content": answer,
+                    "sources": sources_json,
+                    "model": model,
+                    "tokens": usage.get("total_tokens", 0),
+                },
+            )
 
             # 更新 notebook last_qa_at
-            sess.execute(text("""
+            sess.execute(
+                text("""
                 UPDATE biz.research_notebook SET last_qa_at = NOW()
                 WHERE stock_code = :code
-            """), {"code": stock_code})
+            """),
+                {"code": stock_code},
+            )
 
     return {
         "answer": answer,
@@ -364,13 +582,16 @@ def ask_stock(
 def get_chat_history(stock_code: str, limit: int = 50) -> list[dict]:
     """获取某只股票的对话历史。"""
     with get_session() as sess:
-        rows = sess.execute(text("""
+        rows = sess.execute(
+            text("""
             SELECT id, role, content, sources, model, tokens_used, created_at
             FROM biz.research_message
             WHERE stock_code = :code
             ORDER BY created_at DESC
             LIMIT :limit
-        """), {"code": stock_code, "limit": limit}).fetchall()
+        """),
+            {"code": stock_code, "limit": limit},
+        ).fetchall()
 
     return [
         {

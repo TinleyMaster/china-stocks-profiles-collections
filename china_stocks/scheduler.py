@@ -14,6 +14,7 @@ APScheduler 定时调度器。
   - 每日 21:00 — Phase C 资金面画像（北向 + 融资融券）
   - 每周一 20:00 — Phase C 财务指标刷新（周频足够）
   - 每周二至六 02:00 — 公告 PDF 下载（夜间闲时批量下载）
+  - 每周二至六 03:00 — 文档解析切块（PDF → doc_chunk，RAG 用）
   - 每周三 03:00 — Phase D 公司事件采集（分红/解禁/业绩预告/回购/增减持）
   - 每周日 03:00 — Phase C 股东画像（十大股东 + 质押 + 股东户数）
   - 每周日 06:00 — Phase D 投研笔记本刷新（完整性清单更新）
@@ -89,6 +90,7 @@ def build_scheduler() -> BlockingScheduler:
     from .biz.capital_snapshot import run_capital_snapshot
     from .biz.shareholder_snapshot import run_shareholder_snapshot
     from .biz.research_notebook import run_build_notebooks
+    from .biz.doc_parser import run_parse_docs
     from .src.phase_d_events import run_corporate_events
 
     # 每日 08:30 — 股票池 + 行业刷新
@@ -168,6 +170,15 @@ def build_scheduler() -> BlockingScheduler:
         lambda: run_with_alert("Phase B2-公告下载", run_download_announcements),
         CronTrigger(day_of_week="tue,sat", hour=2, minute=0, timezone=TIMEZONE),
         id="phase_b2_download",
+        misfire_grace_time=86400,
+        max_instances=1,
+    )
+
+    # 每周二至六 03:00 — 文档解析切块（下载完之后马上解析，供 RAG 用）
+    scheduler.add_job(
+        lambda: run_with_alert("Phase B-文档解析", run_parse_docs),
+        CronTrigger(day_of_week="tue,sat", hour=3, minute=0, timezone=TIMEZONE),
+        id="phase_b_parse",
         misfire_grace_time=86400,
         max_instances=1,
     )

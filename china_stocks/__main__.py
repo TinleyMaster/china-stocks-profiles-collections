@@ -249,6 +249,40 @@ def cmd_notebook_fill(args) -> None:
     run_fill_notebook(args.code.zfill(6), items=items)
 
 
+def cmd_parse_docs(args) -> None:
+    from .biz.doc_parser import parse_docs, get_chunk_stats
+    from .sys import finish_run, start_run
+
+    codes = args.codes.split(",") if args.codes else None
+    dtypes = args.types.split(",") if args.types else None
+
+    if args.stats:
+        stats = get_chunk_stats()
+        print(f"总块数: {stats['total_chunks']}")
+        print(f"总文档: {stats['total_docs']}")
+        print(f"总股票: {stats['total_stocks']}")
+        print(f"总 tokens: {stats['total_tokens']}")
+        return
+
+    run = start_run(
+        platform_code="local",
+        phase="phase_b_parse",
+        target=f"limit={args.limit}, types={dtypes}",
+    )
+    try:
+        docs, chunks = parse_docs(
+            stock_codes=codes,
+            limit=args.limit,
+            doc_types=dtypes,
+        )
+        finish_run(run, status="success", rows_inserted=docs, rows_updated=chunks)
+        print(f"解析完成: {docs} 篇文档, {chunks} 个块")
+    except Exception as e:
+        logger.exception(f"文档解析失败: {e}")
+        finish_run(run, status="failed", error_msg=str(e))
+        raise
+
+
 def cmd_ask(args) -> None:
     from .biz.rag import ask_stock
 
@@ -401,6 +435,18 @@ def main() -> None:
     ask.add_argument("question", type=str, help="问题")
     ask.add_argument("--no-save", action="store_true", help="不保存对话历史")
 
+    p_parse = sub.add_parser(
+        "parse-docs", help="解析已下载的文档 PDF，切块写入 doc_chunk"
+    )
+    p_parse.add_argument("--codes", type=str, help="指定股票代码，逗号分隔")
+    p_parse.add_argument("--limit", type=int, help="限制解析数量")
+    p_parse.add_argument(
+        "--types",
+        type=str,
+        help="指定文档类型（announcement/research/survey...），逗号分隔",
+    )
+    p_parse.add_argument("--stats", action="store_true", help="查看切块统计信息")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -427,6 +473,7 @@ def main() -> None:
         "notebook-missing": cmd_notebook_missing,
         "notebook-fill": cmd_notebook_fill,
         "ask": cmd_ask,
+        "parse-docs": cmd_parse_docs,
     }
     dispatch[args.command](args)
 
