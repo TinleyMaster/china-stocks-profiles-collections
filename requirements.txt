@@ -11,3 +11,4 @@ tenacity>=8.2.0
 loguru>=0.7.0
 pymupdf>=1.24.0
 tiktoken>=0.7.0
+flask>=3.0.0

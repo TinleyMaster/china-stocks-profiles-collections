@@ -48,6 +48,10 @@ SMTP_USER = _get_env("SMTP_USER", "")
 SMTP_PASSWORD = _get_env("SMTP_PASSWORD", "")
 ALERT_EMAIL_TO = _get_env("ALERT_EMAIL_TO", "")
 
+# ── Web 工作台 ───────────────────────────────────────────────
+WEB_HOST = _get_env("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(_get_env("WEB_PORT", "8080"))
+
 
 # ── 工具 ──────────────────────────────────────────────────────
 def db_url() -> str:

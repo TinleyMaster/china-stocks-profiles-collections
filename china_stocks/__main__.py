@@ -283,6 +283,22 @@ def cmd_parse_docs(args) -> None:
         raise
 
 
+def cmd_web(_args) -> None:
+    """独立启动 Web 工作台（无调度器）。"""
+    import time
+    from .web_app import start_web_server
+
+    start_web_server(port=8080)
+    print("Web 工作台已启动: http://localhost:8080")
+    print("按 Ctrl+C 退出")
+
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n已退出")
+
+
 def cmd_ask(args) -> None:
     from .biz.rag import ask_stock
 
@@ -447,6 +463,8 @@ def main() -> None:
     )
     p_parse.add_argument("--stats", action="store_true", help="查看切块统计信息")
 
+    sub.add_parser("web", help="启动 Web 工作台（独立运行，无调度器）")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -474,6 +492,7 @@ def main() -> None:
         "notebook-fill": cmd_notebook_fill,
         "ask": cmd_ask,
         "parse-docs": cmd_parse_docs,
+        "web": cmd_web,
     }
     dispatch[args.command](args)
 
