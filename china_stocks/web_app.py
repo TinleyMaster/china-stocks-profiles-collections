@@ -129,6 +129,206 @@ def api_stats():
 
 
 # ============================================================
+# API: 行业列表
+# ============================================================
+
+
+@app.route("/api/industries")
+def api_industries():
+    """获取申万行业列表（一级 + 二级树状结构）。"""
+    with get_session() as sess:
+        rows = sess.execute(
+            text("""
+            SELECT industry_l1, industry_l2, COUNT(*) as stock_count
+            FROM core.stock
+            WHERE industry_l1 IS NOT NULL AND industry_l2 IS NOT NULL
+            GROUP BY industry_l1, industry_l2
+            ORDER BY industry_l1, industry_l2
+        """)
+        ).fetchall()
+
+    industries = {}
+    for r in rows:
+        if r.industry_l1 not in industries:
+            industries[r.industry_l1] = []
+        industries[r.industry_l1].append(
+            {
+                "name": r.industry_l2,
+                "stock_count": r.stock_count,
+            }
+        )
+
+    return jsonify(
+        [{"name": l1, "children": children} for l1, children in industries.items()]
+    )
+
+
+# ============================================================
+# API: 股票筛选器
+# ============================================================
+
+
+@app.route("/api/screener")
+def api_screener():
+    """
+    股票筛选器，支持多条件：
+      - industry_l1: 申万一级行业
+      - industry_l2: 申万二级行业
+      - min_cap / max_cap: 市值范围（亿元）
+      - min_pe / max_pe: PE(TTM) 范围
+      - min_pb / max_pb: PB 范围
+      - min_change / max_change: 涨跌幅范围（%）
+      - min_roe / max_roe: ROE 范围（%）
+      - min_turnover / max_turnover: 换手率范围（%）
+      - sort_by: 排序字段（market_cap / pe / pb / change_pct / roe / turnover）
+      - sort_order: asc / desc
+      - page / page_size: 分页
+    """
+    # 解析参数
+    industry_l1 = request.args.get("industry_l1", "").strip() or None
+    industry_l2 = request.args.get("industry_l2", "").strip() or None
+    min_cap = request.args.get("min_cap", type=float)
+    max_cap = request.args.get("max_cap", type=float)
+    min_pe = request.args.get("min_pe", type=float)
+    max_pe = request.args.get("max_pe", type=float)
+    min_pb = request.args.get("min_pb", type=float)
+    max_pb = request.args.get("max_pb", type=float)
+    min_change = request.args.get("min_change", type=float)
+    max_change = request.args.get("max_change", type=float)
+    min_roe = request.args.get("min_roe", type=float)
+    max_roe = request.args.get("max_roe", type=float)
+    min_turnover = request.args.get("min_turnover", type=float)
+    max_turnover = request.args.get("max_turnover", type=float)
+    sort_by = request.args.get("sort_by", "market_cap")
+    sort_order = request.args.get("sort_order", "desc")
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = min(100, request.args.get("page_size", 30, type=int))
+    offset = (page - 1) * page_size
+
+    # 允许的排序字段
+    allowed_sorts = {
+        "market_cap": "b.total_market_cap",
+        "pe": "b.pe_ttm",
+        "pb": "b.pb",
+        "change_pct": "b.change_pct",
+        "roe": "f.roe",
+        "turnover": "b.turnover_rate",
+    }
+    sort_expr = allowed_sorts.get(sort_by, "b.total_market_cap")
+    sort_order_sql = "ASC" if sort_order == "asc" else "DESC"
+
+    # 构建 WHERE 条件
+    conditions = []
+    params = {}
+
+    if industry_l1:
+        conditions.append("s.industry_l1 = :ind1")
+        params["ind1"] = industry_l1
+    if industry_l2:
+        conditions.append("s.industry_l2 = :ind2")
+        params["ind2"] = industry_l2
+    if min_cap is not None:
+        conditions.append("b.total_market_cap >= :min_cap * 1e8")
+        params["min_cap"] = min_cap
+    if max_cap is not None:
+        conditions.append("b.total_market_cap <= :max_cap * 1e8")
+        params["max_cap"] = max_cap
+    if min_pe is not None:
+        conditions.append("b.pe_ttm >= :min_pe AND b.pe_ttm > 0")
+        params["min_pe"] = min_pe
+    if max_pe is not None:
+        conditions.append("b.pe_ttm <= :max_pe AND b.pe_ttm > 0")
+        params["max_pe"] = max_pe
+    if min_pb is not None:
+        conditions.append("b.pb >= :min_pb AND b.pb > 0")
+        params["min_pb"] = min_pb
+    if max_pb is not None:
+        conditions.append("b.pb <= :max_pb AND b.pb > 0")
+        params["max_pb"] = max_pb
+    if min_change is not None:
+        conditions.append("b.change_pct >= :min_change")
+        params["min_change"] = min_change
+    if max_change is not None:
+        conditions.append("b.change_pct <= :max_change")
+        params["max_change"] = max_change
+    if min_roe is not None:
+        conditions.append("f.roe >= :min_roe")
+        params["min_roe"] = min_roe
+    if max_roe is not None:
+        conditions.append("f.roe <= :max_roe")
+        params["max_roe"] = max_roe
+    if min_turnover is not None:
+        conditions.append("b.turnover_rate >= :min_turnover")
+        params["min_turnover"] = min_turnover
+    if max_turnover is not None:
+        conditions.append("b.turnover_rate <= :max_turnover")
+        params["max_turnover"] = max_turnover
+
+    where_sql = ""
+    if conditions:
+        where_sql = "WHERE " + " AND ".join(conditions)
+
+    # 总数
+    count_sql = f"""
+        SELECT COUNT(*)
+        FROM core.stock s
+        LEFT JOIN biz.stock_basic b ON b.stock_code = s.stock_code
+        LEFT JOIN biz.finance_snapshot f ON f.stock_code = s.stock_code
+        {where_sql}
+    """
+
+    # 查询数据
+    data_sql = f"""
+        SELECT s.stock_code, s.stock_name, s.industry_l1, s.industry_l2,
+               b.close, b.change_pct, b.total_market_cap, b.pe_ttm, b.pb,
+               b.turnover_rate, f.roe, f.revenue_yoy, f.net_profit_yoy
+        FROM core.stock s
+        LEFT JOIN biz.stock_basic b ON b.stock_code = s.stock_code
+        LEFT JOIN biz.finance_snapshot f ON f.stock_code = s.stock_code
+        {where_sql}
+        ORDER BY {sort_expr} {sort_order_sql} NULLS LAST
+        LIMIT :page_size OFFSET :offset
+    """
+    params["page_size"] = page_size
+    params["offset"] = offset
+
+    with get_session() as sess:
+        total = sess.execute(text(count_sql), params).scalar() or 0
+        rows = sess.execute(text(data_sql), params).fetchall()
+
+    results = []
+    for r in rows:
+        results.append(
+            {
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name,
+                "industry_l1": r.industry_l1,
+                "industry_l2": r.industry_l2,
+                "close": float(r.close) if r.close else None,
+                "change_pct": float(r.change_pct) if r.change_pct else None,
+                "total_market_cap": float(r.total_market_cap)
+                if r.total_market_cap
+                else None,
+                "pe_ttm": float(r.pe_ttm) if r.pe_ttm else None,
+                "pb": float(r.pb) if r.pb else None,
+                "turnover_rate": float(r.turnover_rate) if r.turnover_rate else None,
+                "roe": float(r.roe) if r.roe else None,
+                "revenue_yoy": float(r.revenue_yoy) if r.revenue_yoy else None,
+                "net_profit_yoy": float(r.net_profit_yoy) if r.net_profit_yoy else None,
+            }
+        )
+
+    return jsonify(
+        {
+            "results": results,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    )
+
+
+# ============================================================
 # API: 股票搜索 + 详情
 # ============================================================
 
@@ -916,6 +1116,7 @@ INDEX_HTML = r"""
     </div>
     <nav class="flex-1 p-2 space-y-1">
       <a href="#" class="nav-item active block px-4 py-2 rounded text-sm" data-page="dashboard">📊 仪表盘</a>
+      <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="screener">🔍 选股</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="watchlist">⭐ 自选股</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="docs">📄 文档检索</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="ask">💬 智能问答</a>
@@ -954,6 +1155,7 @@ INDEX_HTML = r"""
 // ============================================================
 const pages = {
   dashboard: renderDashboard,
+  screener: renderScreener,
   watchlist: renderWatchlist,
   docs: renderDocs,
   ask: renderAsk,
@@ -1867,6 +2069,247 @@ function switchKlinePeriod(period) {
     }
   });
   loadKline(currentKlineCode, period);
+}
+
+// ============================================================
+// 选股页面
+// ============================================================
+let screenerIndustries = null;
+let screenerPage = 1;
+let screenerSortBy = 'market_cap';
+let screenerSortOrder = 'desc';
+
+async function renderScreener() {
+  const content = document.getElementById('page-content');
+  content.innerHTML = '<div class="flex items-center gap-2"><span class="loading"></span> 加载中...</div>';
+
+  // 加载行业数据（缓存）
+  if (!screenerIndustries) {
+    screenerIndustries = await api('/api/industries');
+  }
+
+  content.innerHTML = `
+    <h2 class="text-2xl font-bold mb-6">🔍 股票筛选</h2>
+
+    <!-- 筛选条件 -->
+    <div class="card p-5 mb-6">
+      <div class="grid grid-cols-4 gap-4">
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">申万一级行业</label>
+          <select id="scr-ind1" onchange="onIndustry1Change()" class="w-full px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">全部行业</option>
+            ${screenerIndustries.map(i => `<option value="${i.name}">${i.name}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">申万二级行业</label>
+          <select id="scr-ind2" class="w-full px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">全部二级行业</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">市值（亿元）</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-cap" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-cap" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">PE(TTM)</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-pe" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-pe" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">PB</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-pb" step="0.1" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-pb" step="0.1" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">涨跌幅 (%)</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-change" step="0.1" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-change" step="0.1" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">ROE (%)</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-roe" step="0.1" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-roe" step="0.1" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-500 block mb-1">换手率 (%)</label>
+          <div class="flex gap-2">
+            <input type="number" id="scr-min-turn" step="0.1" placeholder="最小" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <input type="number" id="scr-max-turn" step="0.1" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="resetScreener()" class="px-4 py-2 border rounded hover:bg-gray-50">重置</button>
+        <button onclick="runScreener()" class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">🔍 开始筛选</button>
+      </div>
+    </div>
+
+    <!-- 结果表格 -->
+    <div id="screener-results" class="card">
+      <div class="text-center text-gray-400 py-12">设置条件后点击"开始筛选"</div>
+    </div>
+  `;
+}
+
+function onIndustry1Change() {
+  const ind1 = document.getElementById('scr-ind1').value;
+  const ind2Select = document.getElementById('scr-ind2');
+  if (!ind1 || !screenerIndustries) {
+    ind2Select.innerHTML = '<option value="">全部二级行业</option>';
+    return;
+  }
+  const industry = screenerIndustries.find(i => i.name === ind1);
+  ind2Select.innerHTML = '<option value="">全部二级行业</option>' +
+    (industry ? industry.children.map(c => `<option value="${c.name}">${c.name} (${c.stock_count})</option>`).join('') : '');
+}
+
+function resetScreener() {
+  document.getElementById('scr-ind1').value = '';
+  document.getElementById('scr-ind2').innerHTML = '<option value="">全部二级行业</option>';
+  ['min-cap', 'max-cap', 'min-pe', 'max-pe', 'min-pb', 'max-pb',
+   'min-change', 'max-change', 'min-roe', 'max-roe', 'min-turn', 'max-turn'
+  ].forEach(id => { const el = document.getElementById('scr-' + id); if (el) el.value = ''; });
+  screenerPage = 1;
+  document.getElementById('screener-results').innerHTML =
+    '<div class="text-center text-gray-400 py-12">设置条件后点击"开始筛选"</div>';
+}
+
+function _getVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const v = el.value.trim();
+  return v === '' ? null : Number(v);
+}
+
+async function runScreener(page = 1) {
+  screenerPage = page;
+  const resultsDiv = document.getElementById('screener-results');
+  resultsDiv.innerHTML = '<div class="flex justify-center py-12"><span class="loading"></span></div>';
+
+  const params = new URLSearchParams();
+  const ind1 = document.getElementById('scr-ind1').value;
+  const ind2 = document.getElementById('scr-ind2').value;
+  if (ind1) params.set('industry_l1', ind1);
+  if (ind2) params.set('industry_l2', ind2);
+
+  const fields = [
+    ['min-cap', 'min_cap'], ['max-cap', 'max_cap'],
+    ['min-pe', 'min_pe'], ['max-pe', 'max_pe'],
+    ['min-pb', 'min_pb'], ['max-pb', 'max_pb'],
+    ['min-change', 'min_change'], ['max-change', 'max_change'],
+    ['min-roe', 'min_roe'], ['max-roe', 'max_roe'],
+    ['min-turn', 'min_turnover'], ['max-turn', 'max_turnover'],
+  ];
+  fields.forEach(([id, key]) => {
+    const v = _getVal('scr-' + id);
+    if (v !== null) params.set(key, v);
+  });
+
+  params.set('sort_by', screenerSortBy);
+  params.set('sort_order', screenerSortOrder);
+  params.set('page', page);
+  params.set('page_size', 30);
+
+  const data = await api(`/api/screener?${params.toString()}`);
+  renderScreenerResults(data);
+}
+
+function renderScreenerResults(data) {
+  const resultsDiv = document.getElementById('screener-results');
+  if (!data.results || data.results.length === 0) {
+    resultsDiv.innerHTML = '<div class="text-center text-gray-400 py-12">没有找到符合条件的股票</div>';
+    return;
+  }
+
+  const totalPages = Math.ceil(data.total / data.page_size);
+  const sortCol = (field, label) => {
+    const isActive = screenerSortBy === field;
+    const arrow = isActive ? (screenerSortOrder === 'desc' ? ' ↓' : ' ↑') : '';
+    return `<th class="text-right p-3 text-sm text-gray-600 cursor-pointer hover:bg-gray-50 ${isActive ? 'text-blue-600' : ''}"
+      onclick="sortScreener('${field}')">${label}${arrow}</th>`;
+  };
+
+  resultsDiv.innerHTML = `
+    <div class="p-4 border-b flex justify-between items-center">
+      <div class="text-sm text-gray-500">共 <b>${data.total}</b> 只股票符合条件</div>
+      <div class="text-xs text-gray-400">点击列标题可排序</div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-gray-50 border-b sticky top-0">
+          <tr>
+            <th class="text-left p-3 text-sm text-gray-600">股票</th>
+            <th class="text-left p-3 text-sm text-gray-600">行业</th>
+            ${sortCol('market_cap', '市值')}
+            <th class="text-right p-3 text-sm text-gray-600">收盘价</th>
+            ${sortCol('change_pct', '涨跌幅')}
+            ${sortCol('pe', 'PE(TTM)')}
+            ${sortCol('pb', 'PB')}
+            ${sortCol('roe', 'ROE')}
+            ${sortCol('turnover', '换手率')}
+          </tr>
+        </thead>
+        <tbody>
+          ${data.results.map(s => `
+            <tr class="border-b hover:bg-gray-50 cursor-pointer" onclick="selectStock('${s.stock_code}', '${s.stock_name}')">
+              <td class="p-3">
+                <div class="font-medium">${s.stock_name}</div>
+                <div class="text-xs text-gray-400">${s.stock_code}</div>
+              </td>
+              <td class="p-3 text-xs text-gray-500">
+                <div>${s.industry_l1 || ''}</div>
+                <div class="text-gray-400">${s.industry_l2 || ''}</div>
+              </td>
+              <td class="text-right p-3 font-medium">${fmtMoney(s.total_market_cap)}</td>
+              <td class="text-right p-3">${s.close ?? 'N/A'}</td>
+              <td class="text-right p-3 font-medium ${s.change_pct >= 0 ? 'text-red-500' : 'text-green-500'}">
+                ${s.change_pct !== null && s.change_pct !== undefined ? (s.change_pct > 0 ? '+' : '') + s.change_pct.toFixed(2) + '%' : 'N/A'}
+              </td>
+              <td class="text-right p-3">${s.pe_ttm ?? 'N/A'}</td>
+              <td class="text-right p-3">${s.pb ?? 'N/A'}</td>
+              <td class="text-right p-3">${s.roe !== null && s.roe !== undefined ? s.roe.toFixed(2) + '%' : 'N/A'}</td>
+              <td class="text-right p-3">${s.turnover_rate !== null && s.turnover_rate !== undefined ? s.turnover_rate.toFixed(2) + '%' : 'N/A'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 分页 -->
+    <div class="p-4 border-t flex justify-center items-center gap-2">
+      <button onclick="runScreener(${screenerPage - 1})" ${screenerPage <= 1 ? 'disabled' : ''}
+        class="px-3 py-1 border rounded text-sm ${screenerPage <= 1 ? 'text-gray-300 cursor-not-allowed' : 'hover:bg-gray-50'}">
+        上一页
+      </button>
+      <span class="text-sm text-gray-500">第 ${screenerPage} / ${totalPages} 页</span>
+      <button onclick="runScreener(${screenerPage + 1})" ${screenerPage >= totalPages ? 'disabled' : ''}
+        class="px-3 py-1 border rounded text-sm ${screenerPage >= totalPages ? 'text-gray-300 cursor-not-allowed' : 'hover:bg-gray-50'}">
+        下一页
+      </button>
+    </div>
+  `;
+}
+
+function sortScreener(field) {
+  if (screenerSortBy === field) {
+    screenerSortOrder = screenerSortOrder === 'desc' ? 'asc' : 'desc';
+  } else {
+    screenerSortBy = field;
+    screenerSortOrder = 'desc';
+  }
+  runScreener(screenerPage);
 }
 
 // ============================================================
