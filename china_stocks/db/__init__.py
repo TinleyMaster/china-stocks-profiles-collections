@@ -11,8 +11,8 @@ from ..config import db_url
 
 _engine = create_engine(
     db_url(),
-    pool_size=5,
-    max_overflow=10,
+    pool_size=2,
+    max_overflow=3,
     pool_pre_ping=True,
     pool_recycle=1800,  # 30 分钟回收旧连接，避免长时间空闲被服务端断开
     future=True,
