@@ -7,8 +7,11 @@ spec:
   docker:
     dockerfile: Dockerfile
   env:
+    - key: DATABASE_URL
+      description: PostgreSQL 连接串（优先使用，Zeabur 托管数据库直接填这个）
+      secret: true
     - key: DB_HOST
-      description: PostgreSQL 主机地址（Zeabur 上选择已部署的 PG 服务）
+      description: PostgreSQL 主机地址（不用 DATABASE_URL 时填）
     - key: DB_PORT
       default: "5432"
     - key: DB_NAME
@@ -16,7 +19,7 @@ spec:
     - key: DB_USER
       default: postgres
     - key: DB_PASSWORD
-      description: 数据库密码（Secret）
+      description: 数据库密码（Secret，不用 DATABASE_URL 时填）
       secret: true
     - key: SCHEDULER_ENABLED
       default: "true"

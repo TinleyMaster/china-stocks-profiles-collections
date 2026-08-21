@@ -1,4 +1,5 @@
 """全局配置，从 .env 读取。"""
+
 from __future__ import annotations
 
 import os
@@ -20,6 +21,9 @@ def _get_env(name: str, default: str | None = None) -> str:
 
 
 # ── 数据库 ────────────────────────────────────────────────────
+# 优先使用 DATABASE_URL（Zeabur/Heroku 等平台的标准整串 URL）
+# 如果没有，再用 DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD 拼装
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_HOST = _get_env("DB_HOST", "localhost")
 DB_PORT = int(_get_env("DB_PORT", "5432"))
 DB_NAME = _get_env("DB_NAME", "china_stocks")
@@ -29,6 +33,7 @@ DB_PASSWORD = _get_env("DB_PASSWORD", "postgres")
 # ── 调度 ──────────────────────────────────────────────────────
 SCHEDULER_ENABLED = _get_env("SCHEDULER_ENABLED", "true").lower() == "true"
 TIMEZONE = _get_env("TIMEZONE", "Asia/Shanghai")
+
 
 # ── 股票池 ────────────────────────────────────────────────────
 def _parse_csv(val: str) -> list[str]:
@@ -55,5 +60,22 @@ WEB_PORT = int(_get_env("WEB_PORT", "8080"))
 
 # ── 工具 ──────────────────────────────────────────────────────
 def db_url() -> str:
-    """返回 SQLAlchemy 用的连接字符串。"""
-    return f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    """返回 SQLAlchemy 用的连接字符串。
+
+    优先级：
+    1. DATABASE_URL 环境变量（Zeabur 等平台标准）
+    2. 用 DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD 拼装
+    """
+    if DATABASE_URL:
+        # postgres:// -> postgresql+psycopg2:// 兼容性处理
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg2://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+        elif url.startswith("postgresql+psycopg2://"):
+            pass  # 已经是正确格式
+        return url
+    return (
+        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
