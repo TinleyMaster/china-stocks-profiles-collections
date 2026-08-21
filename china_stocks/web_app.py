@@ -300,6 +300,89 @@ def api_stock_detail(code):
 
 
 # ============================================================
+# API: K线数据
+# ============================================================
+
+
+@app.route("/api/stock/<code>/kline")
+def api_stock_kline(code):
+    """
+    获取股票日线K线数据。
+    支持 ?period=  参数：
+      - period: 天数，默认 120 天
+    返回 ECharts 友好格式：[[日期, 开, 收, 低, 高, 成交量, ...], ...]
+    """
+    code = code.zfill(6)
+    period = int(request.args.get("period", 120))
+    if period > 1000:
+        period = 1000
+
+    with get_session() as sess:
+        rows = sess.execute(
+            text("""
+            SELECT trade_date, open, high, low, close, volume, amount,
+                   change_pct, turnover_rate
+            FROM src_akshare.stock_daily
+            WHERE stock_code = :code
+            ORDER BY trade_date DESC
+            LIMIT :period
+        """),
+            {"code": code, "period": period},
+        ).fetchall()
+
+    if not rows:
+        return jsonify({"code": code, "data": [], "count": 0})
+
+    # 按日期升序排列（ECharts 需要）
+    rows = list(reversed(rows))
+
+    # 计算 MA5/MA10/MA20
+    closes = [float(r.close) for r in rows if r.close]
+    ma5 = _calc_ma(closes, 5)
+    ma10 = _calc_ma(closes, 10)
+    ma20 = _calc_ma(closes, 20)
+
+    data = []
+    for i, r in enumerate(rows):
+        data.append(
+            [
+                str(r.trade_date),  # 0: 日期
+                float(r.open) if r.open else None,  # 1: 开盘
+                float(r.close) if r.close else None,  # 2: 收盘
+                float(r.low) if r.low else None,  # 3: 最低
+                float(r.high) if r.high else None,  # 4: 最高
+                int(r.volume) if r.volume else 0,  # 5: 成交量（手）
+                float(r.amount) if r.amount else None,  # 6: 成交额（元）
+                float(r.change_pct) if r.change_pct else None,  # 7: 涨跌幅
+                ma5[i] if i < len(ma5) else None,  # 8: MA5
+                ma10[i] if i < len(ma10) else None,  # 9: MA10
+                ma20[i] if i < len(ma20) else None,  # 10: MA20
+            ]
+        )
+
+    return jsonify(
+        {
+            "code": code,
+            "period": period,
+            "count": len(data),
+            "data": data,
+        }
+    )
+
+
+def _calc_ma(values: list[float], period: int) -> list[Optional[float]]:
+    """计算移动平均线。"""
+    result = []
+    for i in range(len(values)):
+        if i < period - 1:
+            result.append(None)
+        else:
+            avg = sum(values[i - period + 1 : i + 1]) / period
+            result.append(round(avg, 4))
+    return result
+
+
+# ============================================================
 # API: 文档检索
 # ============================================================
 
@@ -804,6 +887,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>A股投研工作台</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
     .nav-item.active { background-color: #1e40af; color: white; }
@@ -1196,6 +1280,20 @@ async function renderStockDetail(params) {
       ${b.as_of_date ? `<div class="text-xs text-gray-400 mt-3">数据截至: ${b.as_of_date.slice(0,10)}</div>` : ''}
     </div>
 
+    <!-- K线图 -->
+    <div class="card p-5 mb-6">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold">K 线走势</h3>
+        <div class="flex gap-1 text-sm">
+          <button onclick="switchKlinePeriod(30)" class="px-2 py-1 border rounded hover:bg-gray-50" data-kp="30">30日</button>
+          <button onclick="switchKlinePeriod(60)" class="px-2 py-1 border rounded hover:bg-gray-50 bg-blue-50 border-blue-300" data-kp="60">60日</button>
+          <button onclick="switchKlinePeriod(120)" class="px-2 py-1 border rounded hover:bg-gray-50" data-kp="120">120日</button>
+          <button onclick="switchKlinePeriod(250)" class="px-2 py-1 border rounded hover:bg-gray-50" data-kp="250">年线</button>
+        </div>
+      </div>
+      <div id="kline-chart" style="height: 400px;"></div>
+    </div>
+
     <div class="grid grid-cols-2 gap-6">
       <!-- 财务指标 -->
       <div class="card p-5">
@@ -1240,6 +1338,9 @@ async function renderStockDetail(params) {
       </div>
     </div>
   `;
+
+  // 加载K线图（等DOM渲染完）
+  setTimeout(() => loadKline(code, 60), 50);
 }
 
 // ============================================================
@@ -1583,6 +1684,189 @@ async function renderNotebook(params = {}) {
       </div>
     ` : ''}
   `;
+}
+
+// ============================================================
+// K线图
+// ============================================================
+let klineChart = null;
+let currentKlinePeriod = 60;
+let currentKlineCode = null;
+
+async function loadKline(code, period = 60) {
+  currentKlineCode = code;
+  currentKlinePeriod = period;
+
+  const resp = await api(`/api/stock/${code}/kline?period=${period}`);
+  if (!resp.data || resp.data.length === 0) {
+    const el = document.getElementById('kline-chart');
+    if (el) el.innerHTML = '<div class="text-center text-gray-400 py-16">暂无行情数据，先采集日线行情</div>';
+    return;
+  }
+
+  renderKlineChart(resp.data);
+}
+
+function renderKlineChart(data) {
+  const dom = document.getElementById('kline-chart');
+  if (!dom) return;
+
+  if (!klineChart) {
+    klineChart = echarts.init(dom);
+    window.addEventListener('resize', () => klineChart && klineChart.resize());
+  }
+
+  const dates = data.map(d => d[0]);
+  const klineData = data.map(d => [d[1], d[2], d[3], d[4]]);  // 开, 收, 低, 高
+  const volumes = data.map((d, i) => {
+    // 成交量柱：涨红跌绿
+    const color = d[2] >= d[1] ? '#ef4444' : '#10b981';
+    return { value: d[5], itemStyle: { color } };
+  });
+  const ma5 = data.map(d => d[8]);
+  const ma10 = data.map(d => d[9]);
+  const ma20 = data.map(d => d[10]);
+
+  const option = {
+    animation: false,
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      backgroundColor: 'rgba(255,255,255,0.95)',
+      borderColor: '#ddd',
+      borderWidth: 1,
+      textStyle: { color: '#333', fontSize: 12 },
+      formatter: function(params) {
+        if (!params || !params.length) return '';
+        const idx = params[0].dataIndex;
+        const d = data[idx];
+        const pct = d[7] !== null ? (d[7] > 0 ? '+' : '') + d[7].toFixed(2) + '%' : 'N/A';
+        return `
+          <div style="font-weight:bold;margin-bottom:4px">${d[0]}</div>
+          开盘: <b>${d[1] ?? 'N/A'}</b><br>
+          收盘: <b>${d[2] ?? 'N/A'}</b><br>
+          最高: <b>${d[4] ?? 'N/A'}</b><br>
+          最低: <b>${d[3] ?? 'N/A'}</b><br>
+          涨跌: <b>${pct}</b><br>
+          成交量: <b>${(d[5] / 10000).toFixed(2)}万手</b><br>
+          成交额: <b>${d[6] ? (d[6] / 100000000).toFixed(2) + '亿' : 'N/A'}</b>
+        `;
+      }
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: [
+      { left: '8%', right: '3%', top: '5%', height: '60%' },
+      { left: '8%', right: '3%', top: '72%', height: '18%' }
+    ],
+    xAxis: [
+      {
+        type: 'category',
+        data: dates,
+        boundaryGap: false,
+        axisLine: { onZero: false },
+        axisLabel: { fontSize: 11 },
+        splitLine: { show: false },
+        min: 'dataMin',
+        max: 'dataMax',
+      },
+      {
+        type: 'category',
+        gridIndex: 1,
+        data: dates,
+        boundaryGap: false,
+        axisLine: { onZero: false },
+        axisTick: { show: false },
+        axisLabel: { show: false },
+        splitLine: { show: false },
+        min: 'dataMin',
+        max: 'dataMax',
+      }
+    ],
+    yAxis: [
+      {
+        scale: true,
+        splitArea: { show: true, areaStyle: { color: ['rgba(0,0,0,0.02)', 'rgba(0,0,0,0)'] } },
+        axisLabel: { fontSize: 11 },
+      },
+      {
+        scale: true,
+        gridIndex: 1,
+        splitNumber: 2,
+        axisLabel: { show: false },
+        splitLine: { show: false },
+      }
+    ],
+    dataZoom: [
+      { type: 'inside', xAxisIndex: [0, 1], start: 50, end: 100 },
+      { show: true, xAxisIndex: [0, 1], type: 'slider', bottom: '2%', height: 18, start: 50, end: 100 }
+    ],
+    series: [
+      {
+        name: 'K线',
+        type: 'candlestick',
+        data: klineData,
+        itemStyle: {
+          color: '#ef4444',
+          color0: '#10b981',
+          borderColor: '#ef4444',
+          borderColor0: '#10b981',
+        },
+      },
+      {
+        name: 'MA5',
+        type: 'line',
+        data: ma5,
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { width: 1, color: '#f59e0b' },
+      },
+      {
+        name: 'MA10',
+        type: 'line',
+        data: ma10,
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { width: 1, color: '#3b82f6' },
+      },
+      {
+        name: 'MA20',
+        type: 'line',
+        data: ma20,
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { width: 1, color: '#a855f7' },
+      },
+      {
+        name: '成交量',
+        type: 'bar',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: volumes,
+      }
+    ],
+    legend: {
+      data: ['K线', 'MA5', 'MA10', 'MA20', '成交量'],
+      top: 0,
+      right: 0,
+      textStyle: { fontSize: 11 },
+    },
+  };
+
+  klineChart.setOption(option);
+}
+
+function switchKlinePeriod(period) {
+  if (!currentKlineCode) return;
+  // 更新按钮状态
+  document.querySelectorAll('[data-kp]').forEach(btn => {
+    const p = parseInt(btn.dataset.kp);
+    if (p === period) {
+      btn.classList.add('bg-blue-50', 'border-blue-300');
+    } else {
+      btn.classList.remove('bg-blue-50', 'border-blue-300');
+    }
+  });
+  loadKline(currentKlineCode, period);
 }
 
 // ============================================================
