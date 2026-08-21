@@ -139,11 +139,11 @@ def api_industries():
     with get_session() as sess:
         rows = sess.execute(
             text("""
-            SELECT industry_l1, industry_l2, COUNT(*) as stock_count
+            SELECT primary_industry_l1 AS industry_l1, primary_industry_l2 AS industry_l2, COUNT(*) as stock_count
             FROM core.stock
-            WHERE industry_l1 IS NOT NULL AND industry_l2 IS NOT NULL
-            GROUP BY industry_l1, industry_l2
-            ORDER BY industry_l1, industry_l2
+            WHERE primary_industry_l1 IS NOT NULL AND primary_industry_l2 IS NOT NULL
+            GROUP BY primary_industry_l1, primary_industry_l2
+            ORDER BY primary_industry_l1, primary_industry_l2
         """)
         ).fetchall()
 
@@ -222,10 +222,10 @@ def api_screener():
     params = {}
 
     if industry_l1:
-        conditions.append("s.industry_l1 = :ind1")
+        conditions.append("s.primary_industry_l1 = :ind1")
         params["ind1"] = industry_l1
     if industry_l2:
-        conditions.append("s.industry_l2 = :ind2")
+        conditions.append("s.primary_industry_l2 = :ind2")
         params["ind2"] = industry_l2
     if min_cap is not None:
         conditions.append("b.total_market_cap >= :min_cap * 1e8")
@@ -279,7 +279,9 @@ def api_screener():
 
     # 查询数据
     data_sql = f"""
-        SELECT s.stock_code, s.stock_name, s.industry_l1, s.industry_l2,
+        SELECT s.stock_code, s.stock_name,
+               s.primary_industry_l1 AS industry_l1,
+               s.primary_industry_l2 AS industry_l2,
                b.close, b.change_pct, b.total_market_cap, b.pe_ttm, b.pb,
                b.turnover_rate, f.roe, f.revenue_yoy, f.net_profit_yoy
         FROM core.stock s
@@ -341,7 +343,9 @@ def api_stock_search():
         return jsonify([])
 
     sql = """
-        SELECT stock_code, stock_name, industry_l1, industry_l2
+        SELECT stock_code, stock_name,
+               primary_industry_l1 AS industry_l1,
+               primary_industry_l2 AS industry_l2
         FROM core.stock
         WHERE stock_code ILIKE :q OR stock_name ILIKE :q
         ORDER BY stock_code
@@ -372,7 +376,10 @@ def api_stock_detail(code):
         # 基本信息
         stock = sess.execute(
             text("""
-            SELECT stock_code, stock_name, industry_l1, industry_l2, list_date
+            SELECT stock_code, stock_name,
+                   primary_industry_l1 AS industry_l1,
+                   primary_industry_l2 AS industry_l2,
+                   list_date
             FROM core.stock WHERE stock_code = :code
         """),
             {"code": code},
@@ -739,7 +746,8 @@ def api_watchlist():
         rows = sess.execute(
             text("""
             SELECT w.stock_code, w.stock_name, w.note, w.tags, w.added_at,
-                   s.industry_l1, s.industry_l2,
+                   s.primary_industry_l1 AS industry_l1,
+                   s.primary_industry_l2 AS industry_l2,
                    b.close, b.change_pct, b.total_market_cap, b.pe_ttm
             FROM biz.watchlist w
             LEFT JOIN core.stock s ON s.stock_code = w.stock_code
