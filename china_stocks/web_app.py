@@ -1194,9 +1194,22 @@ document.querySelectorAll('.nav-item').forEach(item => {
 
 function navigateTo(page, params = {}) {
   currentPage = page;
+  // 子页面对应的主导航高亮
+  const navMap = {
+    stock: 'dashboard',    // 股票详情 → 仪表盘（无专门入口）
+    docs: 'docs',
+    ask: 'ask',
+    notebook: 'notebook',
+    screener: 'screener',
+    watchlist: 'watchlist',
+    tasks: 'tasks',
+    dashboard: 'dashboard',
+  };
+  const activeNav = navMap[page] || 'dashboard';
   document.querySelectorAll('.nav-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.page === page);
-    if (el.dataset.page === page) {
+    const isActive = el.dataset.page === activeNav;
+    el.classList.toggle('active', isActive);
+    if (isActive) {
       el.classList.remove('text-gray-300', 'hover:bg-gray-800');
       el.classList.add('bg-blue-700', 'text-white');
     } else {
@@ -1211,11 +1224,25 @@ function navigateTo(page, params = {}) {
 // 工具函数
 // ============================================================
 async function api(path, options = {}) {
-  const resp = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options,
-  });
-  return resp.json();
+  try {
+    const resp = await fetch(path, {
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options,
+    });
+    if (!resp.ok) {
+      console.error(`API 错误 ${resp.status}: ${path}`);
+      try {
+        const err = await resp.json();
+        return { error: err.error || `HTTP ${resp.status}` };
+      } catch {
+        return { error: `HTTP ${resp.status}` };
+      }
+    }
+    return await resp.json();
+  } catch (e) {
+    console.error(`网络错误: ${path}`, e);
+    return { error: e.message || '网络错误' };
+  }
 }
 
 function fmtMoney(v) {

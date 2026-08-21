@@ -346,4 +346,3 @@ INSERT INTO sys.source_platform (platform_code, platform_name, base_url, is_free
     ('cninfo', '巨潮资讯网', 'http://www.cninfo.com.cn/', TRUE, '证监会指定信息披露平台'),
     ('eastmoney', '东方财富网', 'https://www.eastmoney.com/', TRUE, '行情 / F10 / 研报 / 资金流向')
 ON CONFLICT DO NOTHING;
-"""
