@@ -43,81 +43,95 @@ app.config["JSON_AS_ASCII"] = False  # 中文正常显示
 # API: 仪表盘
 # ============================================================
 
+
 @app.route("/api/stats")
 def api_stats():
     """仪表盘统计数据。"""
     with get_session() as sess:
         # 股票总数
-        total_stocks = sess.execute(
-            text("SELECT COUNT(*) FROM core.stock")
-        ).scalar() or 0
+        total_stocks = (
+            sess.execute(text("SELECT COUNT(*) FROM core.stock")).scalar() or 0
+        )
 
         # 文档总数
-        total_docs = sess.execute(
-            text("SELECT COUNT(*) FROM biz.doc_source_entry")
-        ).scalar() or 0
+        total_docs = (
+            sess.execute(text("SELECT COUNT(*) FROM biz.doc_source_entry")).scalar()
+            or 0
+        )
 
         # 已下载文档数
-        downloaded_docs = sess.execute(
-            text("SELECT COUNT(*) FROM biz.doc_source_entry WHERE is_downloaded = TRUE")
-        ).scalar() or 0
+        downloaded_docs = (
+            sess.execute(
+                text(
+                    "SELECT COUNT(*) FROM biz.doc_source_entry WHERE is_downloaded = TRUE"
+                )
+            ).scalar()
+            or 0
+        )
 
         # 切块总数
-        total_chunks = sess.execute(
-            text("SELECT COUNT(*) FROM biz.doc_chunk")
-        ).scalar() or 0
+        total_chunks = (
+            sess.execute(text("SELECT COUNT(*) FROM biz.doc_chunk")).scalar() or 0
+        )
 
         # 笔记本数
-        total_notebooks = sess.execute(
-            text("SELECT COUNT(*) FROM biz.research_notebook")
-        ).scalar() or 0
+        total_notebooks = (
+            sess.execute(text("SELECT COUNT(*) FROM biz.research_notebook")).scalar()
+            or 0
+        )
 
         # 最近 10 条采集记录
-        recent_runs = sess.execute(text("""
+        recent_runs = sess.execute(
+            text("""
             SELECT run_id, phase, status, rows_inserted, rows_updated,
                    started_at, cost_seconds, error_msg
             FROM sys.ingest_run
             ORDER BY run_id DESC
             LIMIT 10
-        """)).fetchall()
+        """)
+        ).fetchall()
 
         # 各文档类型数量
-        doc_type_stats = sess.execute(text("""
+        doc_type_stats = sess.execute(
+            text("""
             SELECT doc_type, COUNT(*) as cnt
             FROM biz.doc_source_entry
             GROUP BY doc_type
             ORDER BY cnt DESC
-        """)).fetchall()
+        """)
+        ).fetchall()
 
-    return jsonify({
-        "total_stocks": total_stocks,
-        "total_docs": total_docs,
-        "downloaded_docs": downloaded_docs,
-        "total_chunks": total_chunks,
-        "total_notebooks": total_notebooks,
-        "recent_runs": [
-            {
-                "run_id": r.run_id,
-                "phase": r.phase,
-                "status": r.status,
-                "rows_inserted": r.rows_inserted or 0,
-                "rows_updated": r.rows_updated or 0,
-                "started_at": str(r.started_at) if r.started_at else None,
-                "cost_seconds": float(r.cost_seconds) if r.cost_seconds else 0,
-                "error_msg": r.error_msg,
-            }
-            for r in recent_runs
-        ],
-        "doc_type_stats": [
-            {"doc_type": r.doc_type, "count": r.cnt}
-            for r in doc_type_stats
-        ],
-    })
+    return jsonify(
+        {
+            "total_stocks": total_stocks,
+            "total_docs": total_docs,
+            "downloaded_docs": downloaded_docs,
+            "total_chunks": total_chunks,
+            "total_notebooks": total_notebooks,
+            "recent_runs": [
+                {
+                    "run_id": r.run_id,
+                    "phase": r.phase,
+                    "status": r.status,
+                    "rows_inserted": r.rows_inserted or 0,
+                    "rows_updated": r.rows_updated or 0,
+                    "started_at": str(r.started_at) if r.started_at else None,
+                    "cost_seconds": float(r.cost_seconds) if r.cost_seconds else 0,
+                    "error_msg": r.error_msg,
+                }
+                for r in recent_runs
+            ],
+            "doc_type_stats": [
+                {"doc_type": r.doc_type, "count": r.cnt} for r in doc_type_stats
+            ],
+        }
+    )
 
 
 # ============================================================
 # API: 股票搜索 + 详情
 # ============================================================
+
 
 @app.route("/api/stocks/search")
 def api_stock_search():
@@ -136,15 +150,17 @@ def api_stock_search():
     with get_session() as sess:
         rows = sess.execute(text(sql), {"q": f"%{q}%"}).fetchall()
 
-    return jsonify([
-        {
-            "stock_code": r.stock_code,
-            "stock_name": r.stock_name,
-            "industry_l1": r.industry_l1,
-            "industry_l2": r.industry_l2,
-        }
-        for r in rows
-    ])
+    return jsonify(
+        [
+            {
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name,
+                "industry_l1": r.industry_l1,
+                "industry_l2": r.industry_l2,
+            }
+            for r in rows
+        ]
+    )
 
 
 @app.route("/api/stock/<code>")
@@ -154,88 +170,139 @@ def api_stock_detail(code):
 
     with get_session() as sess:
         # 基本信息
-        stock = sess.execute(text("""
+        stock = sess.execute(
+            text("""
             SELECT stock_code, stock_name, industry_l1, industry_l2, list_date
             FROM core.stock WHERE stock_code = :code
-        """), {"code": code}).fetchone()
+        """),
+            {"code": code},
+        ).fetchone()
 
         if not stock:
             return jsonify({"error": "股票不存在"}), 404
 
         # 估值画像
-        basic = sess.execute(text("""
+        basic = sess.execute(
+            text("""
             SELECT close, change_pct, total_market_cap, pe_ttm, pb,
                    turnover_rate, as_of_date
             FROM biz.stock_basic WHERE stock_code = :code
-        """), {"code": code}).fetchone()
+        """),
+            {"code": code},
+        ).fetchone()
 
         # 财务
-        finance = sess.execute(text("""
+        finance = sess.execute(
+            text("""
             SELECT report_date, revenue, revenue_yoy, net_profit, net_profit_yoy,
                    roe, gross_margin, net_margin, debt_ratio, eps, bps
             FROM biz.finance_snapshot WHERE stock_code = :code
-        """), {"code": code}).fetchone()
+        """),
+            {"code": code},
+        ).fetchone()
 
         # 资金面
-        capital = sess.execute(text("""
+        capital = sess.execute(
+            text("""
             SELECT north_hold_pct, margin_balance, as_of_date
             FROM biz.capital_snapshot WHERE stock_code = :code
-        """), {"code": code}).fetchone()
+        """),
+            {"code": code},
+        ).fetchone()
 
         # 文档统计
-        doc_stats = sess.execute(text("""
+        doc_stats = sess.execute(
+            text("""
             SELECT doc_type, COUNT(*) as cnt
             FROM biz.doc_source_entry
             WHERE stock_code = :code
             GROUP BY doc_type
             ORDER BY cnt DESC
-        """), {"code": code}).fetchall()
+        """),
+            {"code": code},
+        ).fetchall()
 
-    return jsonify({
-        "stock": {
-            "stock_code": stock.stock_code,
-            "stock_name": stock.stock_name,
-            "industry_l1": stock.industry_l1,
-            "industry_l2": stock.industry_l2,
-            "list_date": str(stock.list_date) if stock.list_date else None,
-        },
-        "basic": {
-            "close": float(basic.close) if basic and basic.close else None,
-            "change_pct": float(basic.change_pct) if basic and basic.change_pct else None,
-            "total_market_cap": float(basic.total_market_cap) if basic and basic.total_market_cap else None,
-            "pe_ttm": float(basic.pe_ttm) if basic and basic.pe_ttm else None,
-            "pb": float(basic.pb) if basic and basic.pb else None,
-            "turnover_rate": float(basic.turnover_rate) if basic and basic.turnover_rate else None,
-            "as_of_date": str(basic.as_of_date) if basic and basic.as_of_date else None,
-        } if basic else None,
-        "finance": {
-            "report_date": str(finance.report_date) if finance and finance.report_date else None,
-            "revenue": float(finance.revenue) if finance and finance.revenue else None,
-            "revenue_yoy": float(finance.revenue_yoy) if finance and finance.revenue_yoy else None,
-            "net_profit": float(finance.net_profit) if finance and finance.net_profit else None,
-            "net_profit_yoy": float(finance.net_profit_yoy) if finance and finance.net_profit_yoy else None,
-            "roe": float(finance.roe) if finance and finance.roe else None,
-            "gross_margin": float(finance.gross_margin) if finance and finance.gross_margin else None,
-            "net_margin": float(finance.net_margin) if finance and finance.net_margin else None,
-            "debt_ratio": float(finance.debt_ratio) if finance and finance.debt_ratio else None,
-            "eps": float(finance.eps) if finance and finance.eps else None,
-            "bps": float(finance.bps) if finance and finance.bps else None,
-        } if finance else None,
-        "capital": {
-            "north_hold_pct": float(capital.north_hold_pct) if capital and capital.north_hold_pct else None,
-            "margin_balance": float(capital.margin_balance) if capital and capital.margin_balance else None,
-            "as_of_date": str(capital.as_of_date) if capital and capital.as_of_date else None,
-        } if capital else None,
-        "doc_stats": [
-            {"doc_type": r.doc_type, "count": r.cnt}
-            for r in doc_stats
-        ],
-    })
+    return jsonify(
+        {
+            "stock": {
+                "stock_code": stock.stock_code,
+                "stock_name": stock.stock_name,
+                "industry_l1": stock.industry_l1,
+                "industry_l2": stock.industry_l2,
+                "list_date": str(stock.list_date) if stock.list_date else None,
+            },
+            "basic": {
+                "close": float(basic.close) if basic and basic.close else None,
+                "change_pct": float(basic.change_pct)
+                if basic and basic.change_pct
+                else None,
+                "total_market_cap": float(basic.total_market_cap)
+                if basic and basic.total_market_cap
+                else None,
+                "pe_ttm": float(basic.pe_ttm) if basic and basic.pe_ttm else None,
+                "pb": float(basic.pb) if basic and basic.pb else None,
+                "turnover_rate": float(basic.turnover_rate)
+                if basic and basic.turnover_rate
+                else None,
+                "as_of_date": str(basic.as_of_date)
+                if basic and basic.as_of_date
+                else None,
+            }
+            if basic
+            else None,
+            "finance": {
+                "report_date": str(finance.report_date)
+                if finance and finance.report_date
+                else None,
+                "revenue": float(finance.revenue)
+                if finance and finance.revenue
+                else None,
+                "revenue_yoy": float(finance.revenue_yoy)
+                if finance and finance.revenue_yoy
+                else None,
+                "net_profit": float(finance.net_profit)
+                if finance and finance.net_profit
+                else None,
+                "net_profit_yoy": float(finance.net_profit_yoy)
+                if finance and finance.net_profit_yoy
+                else None,
+                "roe": float(finance.roe) if finance and finance.roe else None,
+                "gross_margin": float(finance.gross_margin)
+                if finance and finance.gross_margin
+                else None,
+                "net_margin": float(finance.net_margin)
+                if finance and finance.net_margin
+                else None,
+                "debt_ratio": float(finance.debt_ratio)
+                if finance and finance.debt_ratio
+                else None,
+                "eps": float(finance.eps) if finance and finance.eps else None,
+                "bps": float(finance.bps) if finance and finance.bps else None,
+            }
+            if finance
+            else None,
+            "capital": {
+                "north_hold_pct": float(capital.north_hold_pct)
+                if capital and capital.north_hold_pct
+                else None,
+                "margin_balance": float(capital.margin_balance)
+                if capital and capital.margin_balance
+                else None,
+                "as_of_date": str(capital.as_of_date)
+                if capital and capital.as_of_date
+                else None,
+            }
+            if capital
+            else None,
+            "doc_stats": [{"doc_type": r.doc_type, "count": r.cnt} for r in doc_stats],
+        }
+    )
 
 
 # ============================================================
 # API: 文档检索
 # ============================================================
+
 
 @app.route("/api/docs/search")
 def api_docs_search():
@@ -251,10 +318,12 @@ def api_docs_search():
 
     results = hybrid_search(code.zfill(6), q, limit=limit)
 
-    return jsonify({
-        "results": [r.to_dict() for r in results],
-        "total": len(results),
-    })
+    return jsonify(
+        {
+            "results": [r.to_dict() for r in results],
+            "total": len(results),
+        }
+    )
 
 
 @app.route("/api/docs/list")
@@ -277,44 +346,55 @@ def api_docs_list():
         params["dtype"] = doc_type
 
     with get_session() as sess:
-        total = sess.execute(
-            text(f"SELECT COUNT(*) FROM biz.doc_source_entry {sql_where}"),
-            params,
-        ).scalar() or 0
+        total = (
+            sess.execute(
+                text(f"SELECT COUNT(*) FROM biz.doc_source_entry {sql_where}"),
+                params,
+            ).scalar()
+            or 0
+        )
 
-        rows = sess.execute(text(f"""
+        rows = sess.execute(
+            text(f"""
             SELECT id, title, doc_type, sub_type, publish_date, url,
                    is_downloaded, source_platform, content_topics
             FROM biz.doc_source_entry
             {sql_where}
             ORDER BY publish_date DESC
             LIMIT :page_size OFFSET :offset
-        """), params).fetchall()
+        """),
+            params,
+        ).fetchall()
 
-    return jsonify({
-        "results": [
-            {
-                "id": r.id,
-                "title": r.title,
-                "doc_type": r.doc_type,
-                "sub_type": r.sub_type,
-                "publish_date": str(r.publish_date) if r.publish_date else None,
-                "url": r.url,
-                "is_downloaded": r.is_downloaded,
-                "source_platform": r.source_platform,
-                "content_topics": list(r.content_topics) if r.content_topics else [],
-            }
-            for r in rows
-        ],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-    })
+    return jsonify(
+        {
+            "results": [
+                {
+                    "id": r.id,
+                    "title": r.title,
+                    "doc_type": r.doc_type,
+                    "sub_type": r.sub_type,
+                    "publish_date": str(r.publish_date) if r.publish_date else None,
+                    "url": r.url,
+                    "is_downloaded": r.is_downloaded,
+                    "source_platform": r.source_platform,
+                    "content_topics": list(r.content_topics)
+                    if r.content_topics
+                    else [],
+                }
+                for r in rows
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    )
 
 
 # ============================================================
 # API: RAG 问答
 # ============================================================
+
 
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
@@ -351,6 +431,7 @@ def api_chat_history(code):
 # API: 投研笔记本
 # ============================================================
 
+
 @app.route("/api/notebook/<code>")
 def api_notebook(code):
     """笔记本概览。"""
@@ -364,8 +445,286 @@ def api_notebook(code):
 
 
 # ============================================================
+# API: 自选股
+# ============================================================
+
+
+@app.route("/api/watchlist")
+def api_watchlist():
+    """获取自选股列表（带行情数据）。"""
+    with get_session() as sess:
+        rows = sess.execute(
+            text("""
+            SELECT w.stock_code, w.stock_name, w.note, w.tags, w.added_at,
+                   s.industry_l1, s.industry_l2,
+                   b.close, b.change_pct, b.total_market_cap, b.pe_ttm
+            FROM biz.watchlist w
+            LEFT JOIN core.stock s ON s.stock_code = w.stock_code
+            LEFT JOIN biz.stock_basic b ON b.stock_code = w.stock_code
+            ORDER BY w.added_at DESC
+        """)
+        ).fetchall()
+
+    return jsonify(
+        [
+            {
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name,
+                "note": r.note,
+                "tags": list(r.tags) if r.tags else [],
+                "added_at": str(r.added_at) if r.added_at else None,
+                "industry_l1": r.industry_l1,
+                "industry_l2": r.industry_l2,
+                "close": float(r.close) if r.close else None,
+                "change_pct": float(r.change_pct) if r.change_pct else None,
+                "total_market_cap": float(r.total_market_cap)
+                if r.total_market_cap
+                else None,
+                "pe_ttm": float(r.pe_ttm) if r.pe_ttm else None,
+            }
+            for r in rows
+        ]
+    )
+
+
+@app.route("/api/watchlist", methods=["POST"])
+def api_watchlist_add():
+    """添加自选股。"""
+    data = request.get_json() or {}
+    code = data.get("code", "").strip().zfill(6)
+    if not code:
+        return jsonify({"error": "缺少股票代码"}), 400
+
+    with get_session() as sess:
+        # 取股票名
+        stock = sess.execute(
+            text("SELECT stock_name FROM core.stock WHERE stock_code = :code"),
+            {"code": code},
+        ).fetchone()
+
+        name = stock.stock_name if stock else data.get("name", code)
+
+        sess.execute(
+            text("""
+            INSERT INTO biz.watchlist (stock_code, stock_name, note)
+            VALUES (:code, :name, :note)
+            ON CONFLICT (stock_code) DO NOTHING
+        """),
+            {
+                "code": code,
+                "name": name,
+                "note": data.get("note", ""),
+            },
+        )
+
+    return jsonify({"ok": True, "stock_code": code, "stock_name": name})
+
+
+@app.route("/api/watchlist/<code>", methods=["DELETE"])
+def api_watchlist_remove(code):
+    """移除自选股。"""
+    code = code.zfill(6)
+    with get_session() as sess:
+        sess.execute(
+            text("DELETE FROM biz.watchlist WHERE stock_code = :code"),
+            {"code": code},
+        )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/watchlist/<code>/check")
+def api_watchlist_check(code):
+    """检查是否在自选股中。"""
+    code = code.zfill(6)
+    with get_session() as sess:
+        row = sess.execute(
+            text("SELECT 1 FROM biz.watchlist WHERE stock_code = :code"),
+            {"code": code},
+        ).fetchone()
+    return jsonify({"in_watchlist": row is not None})
+
+
+# ============================================================
+# API: 手动触发采集任务
+# ============================================================
+
+
+@app.route("/api/tasks/list")
+def api_tasks_list():
+    """列出可手动触发的采集任务。"""
+    tasks = [
+        {
+            "id": "phase_a",
+            "name": "Phase A: 股票池刷新",
+            "desc": "全 A 股列表 + 申万行业",
+        },
+        {
+            "id": "phase_daily",
+            "name": "Phase B: 日线行情采集",
+            "desc": "增量更新日线数据",
+        },
+        {
+            "id": "stock_basic",
+            "name": "Phase C: 估值画像",
+            "desc": "stock_basic 表刷新",
+        },
+        {
+            "id": "finance",
+            "name": "Phase C: 财务指标",
+            "desc": "finance_snapshot 表刷新",
+        },
+        {"id": "capital", "name": "Phase C: 资金面画像", "desc": "北向 + 融资融券"},
+        {
+            "id": "shareholder",
+            "name": "Phase C: 股东画像",
+            "desc": "十大股东 + 质押 + 户数",
+        },
+        {
+            "id": "announcements",
+            "name": "Phase B2: 公告入口",
+            "desc": "巨潮资讯网公告抓取",
+        },
+        {"id": "research", "name": "Phase B3: 券商研报", "desc": "东财研报中心抓取"},
+        {"id": "survey", "name": "Phase B3: 调研纪要", "desc": "机构调研纪要抓取"},
+        {"id": "download_docs", "name": "Phase B2: 文档下载", "desc": "批量下载 PDF"},
+        {
+            "id": "parse_docs",
+            "name": "Phase B: 文档解析切块",
+            "desc": "PDF → doc_chunk",
+        },
+        {
+            "id": "events",
+            "name": "Phase D: 公司事件",
+            "desc": "分红/解禁/业绩预告/回购",
+        },
+        {"id": "notebook", "name": "Phase D: 笔记本刷新", "desc": "完整性清单更新"},
+    ]
+    return jsonify(tasks)
+
+
+@app.route("/api/tasks/trigger", methods=["POST"])
+def api_trigger_task():
+    """
+    手动触发采集任务（异步，启动后立即返回）。
+    用后台线程运行，避免阻塞请求。
+    """
+    data = request.get_json() or {}
+    task_id = data.get("task_id", "")
+
+    # 任务映射
+    task_map = {
+        "phase_a": (
+            "Phase A-股票池构建",
+            lambda: __import__(
+                "china_stocks.src.phase_a_stock_pool", fromlist=["run_phase_a"]
+            ).run_phase_a(),
+        ),
+        "phase_daily": (
+            "Phase B-日线行情",
+            lambda: __import__(
+                "china_stocks.src.phase_b_daily", fromlist=["run_phase_daily"]
+            ).run_phase_daily(),
+        ),
+        "stock_basic": (
+            "Phase C-估值画像",
+            lambda: __import__(
+                "china_stocks.biz.stock_basic", fromlist=["run_stock_basic"]
+            ).run_stock_basic(),
+        ),
+        "finance": (
+            "Phase C-财务指标",
+            lambda: __import__(
+                "china_stocks.biz.finance_snapshot", fromlist=["run_finance_snapshot"]
+            ).run_finance_snapshot(),
+        ),
+        "capital": (
+            "Phase C-资金面",
+            lambda: __import__(
+                "china_stocks.biz.capital_snapshot", fromlist=["run_capital_snapshot"]
+            ).run_capital_snapshot(),
+        ),
+        "shareholder": (
+            "Phase C-股东画像",
+            lambda: __import__(
+                "china_stocks.biz.shareholder_snapshot",
+                fromlist=["run_shareholder_snapshot"],
+            ).run_shareholder_snapshot(),
+        ),
+        "announcements": (
+            "Phase B2-公告入口",
+            lambda: __import__(
+                "china_stocks.src.phase_b2_announcements",
+                fromlist=["run_phase_b2_announcements"],
+            ).run_phase_b2_announcements(),
+        ),
+        "research": (
+            "Phase B3-券商研报",
+            lambda: __import__(
+                "china_stocks.src.phase_b3_research", fromlist=["run_phase_b3_research"]
+            ).run_phase_b3_research(),
+        ),
+        "survey": (
+            "Phase B3-调研纪要",
+            lambda: __import__(
+                "china_stocks.src.phase_b3_survey", fromlist=["run_phase_b3_survey"]
+            ).run_phase_b3_survey(),
+        ),
+        "download_docs": (
+            "Phase B2-文档下载",
+            lambda: __import__(
+                "china_stocks.src.phase_b2_download",
+                fromlist=["run_download_announcements"],
+            ).run_download_announcements(),
+        ),
+        "parse_docs": (
+            "Phase B-文档解析",
+            lambda: __import__(
+                "china_stocks.biz.doc_parser", fromlist=["run_parse_docs"]
+            ).run_parse_docs(),
+        ),
+        "events": (
+            "Phase D-公司事件",
+            lambda: __import__(
+                "china_stocks.src.phase_d_events", fromlist=["run_corporate_events"]
+            ).run_corporate_events(),
+        ),
+        "notebook": (
+            "Phase D-笔记本刷新",
+            lambda: __import__(
+                "china_stocks.biz.research_notebook", fromlist=["run_build_notebooks"]
+            ).run_build_notebooks(),
+        ),
+    }
+
+    if task_id not in task_map:
+        return jsonify({"error": f"未知任务: {task_id}"}), 400
+
+    task_name, func = task_map[task_id]
+
+    # 后台线程运行
+    import threading
+
+    def _run():
+        try:
+            logger.info(f"[手动触发] 开始: {task_name}")
+            func()
+            logger.info(f"[手动触发] 完成: {task_name}")
+        except Exception as e:
+            logger.exception(f"[手动触发] 失败: {task_name} - {e}")
+
+    t = threading.Thread(target=_run, daemon=True, name=f"manual-{task_id}")
+    t.start()
+
+    logger.info(f"手动触发任务: {task_name}")
+    return jsonify(
+        {"ok": True, "task_id": task_id, "task_name": task_name, "status": "running"}
+    )
+
+
+# ============================================================
 # 健康检查
 # ============================================================
+
 
 @app.route("/health")
 def health():
@@ -388,16 +747,19 @@ def api_status():
     except Exception as e:
         db_status = f"error: {e}"
 
-    return jsonify({
-        "status": "running",
-        "db": db_status,
-        "version": "1.0.0",
-    })
+    return jsonify(
+        {
+            "status": "running",
+            "db": db_status,
+            "version": "1.0.0",
+        }
+    )
 
 
 # ============================================================
 # 前端页面（内嵌 HTML）
 # ============================================================
+
 
 @app.route("/")
 def index():
@@ -408,15 +770,19 @@ def index():
 # 启动函数
 # ============================================================
 
+
 def start_web_server(host: str = "0.0.0.0", port: int = 8080) -> Thread:
     """
     在后台线程启动 Flask Web 服务。
     取代旧的 health_server，提供完整 Web 工作台 + 健康检查。
     """
+
     def _run():
         try:
             # 生产环境关闭 debug，用单线程避免 APScheduler 冲突
-            app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+            app.run(
+                host=host, port=port, debug=False, use_reloader=False, threaded=True
+            )
         except Exception as e:
             logger.error(f"Web 服务启动失败: {e}")
 
@@ -466,9 +832,11 @@ INDEX_HTML = r"""
     </div>
     <nav class="flex-1 p-2 space-y-1">
       <a href="#" class="nav-item active block px-4 py-2 rounded text-sm" data-page="dashboard">📊 仪表盘</a>
+      <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="watchlist">⭐ 自选股</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="docs">📄 文档检索</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="ask">💬 智能问答</a>
       <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="notebook">📓 投研笔记本</a>
+      <a href="#" class="nav-item block px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800" data-page="tasks">⚙️ 采集任务</a>
     </nav>
     <div class="p-4 border-t border-gray-700">
       <div class="flex items-center gap-2">
@@ -502,10 +870,12 @@ INDEX_HTML = r"""
 // ============================================================
 const pages = {
   dashboard: renderDashboard,
+  watchlist: renderWatchlist,
   docs: renderDocs,
   ask: renderAsk,
   notebook: renderNotebook,
   stock: renderStockDetail,
+  tasks: renderTasks,
 };
 
 let currentPage = 'dashboard';
@@ -581,7 +951,10 @@ async function renderDashboard() {
   const content = document.getElementById('page-content');
   content.innerHTML = '<div class="flex items-center gap-2"><span class="loading"></span> 加载中...</div>';
 
-  const data = await api('/api/stats');
+  const [data, watchlist] = await Promise.all([
+    api('/api/stats'),
+    api('/api/watchlist'),
+  ]);
 
   content.innerHTML = `
     <h2 class="text-2xl font-bold mb-6">仪表盘</h2>
@@ -651,6 +1024,33 @@ async function renderDashboard() {
           }).join('')}
         </div>
       </div>
+    </div>
+
+    <!-- 自选股行情 -->
+    <div class="card p-5 mt-6">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="font-bold">⭐ 自选股行情</h3>
+        <a href="#" onclick="navigateTo('watchlist'); return false;" class="text-sm text-blue-600 hover:underline">查看全部 →</a>
+      </div>
+      ${watchlist.length === 0
+        ? `<div class="text-gray-400 text-center py-6 text-sm">
+            还没有自选股 ·
+            <a href="#" onclick="openStockModal(); return false;" class="text-blue-600 hover:underline">去添加</a>
+          </div>`
+        : `<div class="grid grid-cols-5 gap-3">
+            ${watchlist.slice(0, 5).map(s => `
+              <div onclick="selectStock('${s.stock_code}', '${s.stock_name}')"
+                class="p-3 border rounded hover:border-blue-400 cursor-pointer transition-colors">
+                <div class="font-medium text-sm truncate">${s.stock_name}</div>
+                <div class="text-xs text-gray-400 mb-2">${s.stock_code}</div>
+                <div class="text-lg font-bold">${s.close ?? 'N/A'}</div>
+                <div class="text-xs ${s.change_pct >= 0 ? 'text-red-500' : 'text-green-500'}">
+                  ${s.change_pct !== null && s.change_pct !== undefined ? (s.change_pct > 0 ? '+' : '') + s.change_pct.toFixed(2) + '%' : 'N/A'}
+                </div>
+              </div>
+            `).join('')}
+          </div>`
+      }
     </div>
 
     <!-- 快速操作 -->
@@ -735,6 +1135,10 @@ async function renderStockDetail(params) {
   const data = await api(`/api/stock/${code}`);
   if (data.error) { content.innerHTML = `<div class="text-red-500">${data.error}</div>`; return; }
 
+  // 检查是否在自选股中
+  const check = await api(`/api/watchlist/${code}/check`);
+  const inWatchlist = check.in_watchlist;
+
   const s = data.stock;
   const b = data.basic || {};
   const f = data.finance || {};
@@ -747,6 +1151,13 @@ async function renderStockDetail(params) {
         <p class="text-gray-500 text-sm mt-1">${s.industry_l1 || ''} · ${s.industry_l2 || ''} · 上市日期: ${s.list_date || 'N/A'}</p>
       </div>
       <div class="flex gap-2">
+        <button id="watchlist-btn" onclick="${inWatchlist
+          ? `removeFromWatchlist('${s.stock_code}')`
+          : `addToWatchlist('${s.stock_code}', '${s.stock_name}')`
+        }" class="${inWatchlist
+          ? 'px-4 py-2 bg-yellow-500 text-white rounded hover:bg-yellow-600'
+          : 'px-4 py-2 border rounded hover:bg-gray-50'
+        }">${inWatchlist ? '⭐ 已收藏' : '☆ 收藏'}</button>
         <button onclick="navigateTo('docs', {code: '${s.stock_code}'})" class="px-4 py-2 border rounded hover:bg-gray-50">📄 文档</button>
         <button onclick="navigateTo('ask', {code: '${s.stock_code}'})" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">💬 问答</button>
         <button onclick="navigateTo('notebook', {code: '${s.stock_code}'})" class="px-4 py-2 border rounded hover:bg-gray-50">📓 笔记本</button>
@@ -1172,6 +1583,185 @@ async function renderNotebook(params = {}) {
       </div>
     ` : ''}
   `;
+}
+
+// ============================================================
+// 自选股页面
+// ============================================================
+async function renderWatchlist() {
+  const content = document.getElementById('page-content');
+  content.innerHTML = '<div class="flex items-center gap-2"><span class="loading"></span> 加载中...</div>';
+
+  const data = await api('/api/watchlist');
+
+  content.innerHTML = `
+    <div class="flex justify-between items-center mb-6">
+      <h2 class="text-2xl font-bold">⭐ 自选股</h2>
+      <button onclick="openStockModal()" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+        ➕ 添加自选股
+      </button>
+    </div>
+
+    ${data.length === 0
+      ? `<div class="card p-12 text-center">
+          <div class="text-5xl mb-4">📋</div>
+          <div class="text-gray-500 mb-4">还没有自选股</div>
+          <button onclick="openStockModal()" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+            添加第一只
+          </button>
+        </div>`
+      : `<div class="card overflow-hidden">
+          <table class="w-full">
+            <thead class="bg-gray-50 border-b">
+              <tr>
+                <th class="text-left p-3 text-sm text-gray-600">股票</th>
+                <th class="text-right p-3 text-sm text-gray-600">最新价</th>
+                <th class="text-right p-3 text-sm text-gray-600">涨跌幅</th>
+                <th class="text-right p-3 text-sm text-gray-600">市值</th>
+                <th class="text-right p-3 text-sm text-gray-600">PE(TTM)</th>
+                <th class="text-center p-3 text-sm text-gray-600">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${data.map(s => `
+                <tr class="border-b hover:bg-gray-50 cursor-pointer" onclick="selectStock('${s.stock_code}', '${s.stock_name}')">
+                  <td class="p-3">
+                    <div class="font-medium">${s.stock_name}</div>
+                    <div class="text-xs text-gray-400">${s.stock_code} · ${s.industry_l1 || ''}</div>
+                  </td>
+                  <td class="text-right p-3 font-medium">${s.close ?? 'N/A'}</td>
+                  <td class="text-right p-3 font-medium ${s.change_pct >= 0 ? 'text-red-500' : 'text-green-500'}">
+                    ${s.change_pct !== null && s.change_pct !== undefined ? (s.change_pct > 0 ? '+' : '') + s.change_pct.toFixed(2) + '%' : 'N/A'}
+                  </td>
+                  <td class="text-right p-3">${fmtMoney(s.total_market_cap)}</td>
+                  <td class="text-right p-3">${s.pe_ttm ?? 'N/A'}</td>
+                  <td class="text-center p-3">
+                    <button onclick="event.stopPropagation(); removeFromWatchlist('${s.stock_code}')"
+                      class="text-red-500 hover:text-red-700 text-sm">移除</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>`
+    }
+  `;
+}
+
+async function addToWatchlist(code, name) {
+  const resp = await api('/api/watchlist', {
+    method: 'POST',
+    body: JSON.stringify({ code, name }),
+  });
+  if (resp.ok) {
+    alert(`已添加 ${name} 到自选股`);
+    if (currentPage === 'watchlist') renderWatchlist();
+    if (currentPage === 'stock') {
+      const btn = document.getElementById('watchlist-btn');
+      if (btn) {
+        btn.textContent = '⭐ 已收藏';
+        btn.className = 'px-4 py-2 bg-yellow-500 text-white rounded hover:bg-yellow-600';
+        btn.onclick = () => removeFromWatchlist('${code}');
+      }
+    }
+  }
+}
+
+async function removeFromWatchlist(code) {
+  if (!confirm('确定要移除这只自选股吗？')) return;
+  const resp = await api(`/api/watchlist/${code}`, { method: 'DELETE' });
+  if (resp.ok) {
+    if (currentPage === 'watchlist') renderWatchlist();
+    if (currentPage === 'stock') {
+      const btn = document.getElementById('watchlist-btn');
+      if (btn) {
+        btn.textContent = '☆ 收藏';
+        btn.className = 'px-4 py-2 border rounded hover:bg-gray-50';
+        btn.onclick = () => addToWatchlist(currentStock.stock_code, currentStock.stock_name);
+      }
+    }
+  }
+}
+
+// ============================================================
+// 采集任务页面
+// ============================================================
+async function renderTasks() {
+  const content = document.getElementById('page-content');
+  content.innerHTML = '<div class="flex items-center gap-2"><span class="loading"></span> 加载中...</div>';
+
+  const [tasks, stats] = await Promise.all([
+    api('/api/tasks/list'),
+    api('/api/stats'),
+  ]);
+
+  content.innerHTML = `
+    <h2 class="text-2xl font-bold mb-6">⚙️ 采集任务</h2>
+
+    <div class="grid grid-cols-2 gap-6">
+      <!-- 任务列表 -->
+      <div>
+        <h3 class="font-bold mb-4">可执行任务</h3>
+        <div class="space-y-2">
+          ${tasks.map(t => `
+            <div class="card p-4 flex justify-between items-center">
+              <div>
+                <div class="font-medium">${t.name}</div>
+                <div class="text-xs text-gray-400 mt-1">${t.desc}</div>
+              </div>
+              <button onclick="triggerTask('${t.id}', '${t.name}')"
+                class="px-4 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                ▶ 运行
+              </button>
+            </div>
+          `).join('')}
+        </div>
+        <div class="text-xs text-gray-400 mt-3">
+          💡 提示：任务在后台异步运行，关闭页面不影响执行。可在下方查看最近运行记录。
+        </div>
+      </div>
+
+      <!-- 最近运行记录 -->
+      <div>
+        <h3 class="font-bold mb-4">最近运行记录</h3>
+        <div class="card p-4">
+          <div class="space-y-2">
+            ${stats.recent_runs.map(r => `
+              <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <div>
+                  <div class="font-medium text-sm">${r.phase}</div>
+                  <div class="text-xs text-gray-400 mt-1">
+                    ${r.started_at ? r.started_at.slice(5, 19) : '-'} · 耗时 ${r.cost_seconds?.toFixed(1) || 0}s
+                  </div>
+                </div>
+                <div class="text-right">
+                  ${statusTag(r.status)}
+                  ${r.error_msg ? `<div class="text-xs text-red-500 mt-1 max-w-[200px] truncate">${r.error_msg}</div>` : ''}
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function triggerTask(taskId, taskName) {
+  if (!confirm(`确定要手动运行「${taskName}」吗？`)) return;
+
+  const resp = await api('/api/tasks/trigger', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId }),
+  });
+
+  if (resp.ok) {
+    alert(`任务已启动：${taskName}\n任务在后台运行，可在下方记录中查看进度。`);
+    // 3 秒后刷新记录
+    setTimeout(() => { if (currentPage === 'tasks') renderTasks(); }, 3000);
+  } else {
+    alert(`启动失败：${resp.error}`);
+  }
 }
 
 // ============================================================

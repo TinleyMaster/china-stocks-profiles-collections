@@ -326,6 +326,18 @@ CREATE TABLE IF NOT EXISTS biz.notebook_fill_task (
 
 CREATE INDEX IF NOT EXISTS idx_fill_task ON biz.notebook_fill_task(stock_code, status);
 
+-- 自选股（观察列表）
+CREATE TABLE IF NOT EXISTS biz.watchlist (
+    id              BIGSERIAL PRIMARY KEY,
+    stock_code      TEXT NOT NULL UNIQUE,
+    stock_name      TEXT,
+    note            TEXT,                       -- 备注
+    tags            TEXT[] DEFAULT ARRAY[]::TEXT[],  -- 标签
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlist_added ON biz.watchlist(added_at DESC);
+
 -- ============================================================
 -- 6. 初始化来源平台
 -- ============================================================
