@@ -34,20 +34,46 @@ def _detect_market(code: str) -> str:
 
 
 def fetch_stock_list() -> pd.DataFrame:
-    """获取全 A 股列表（带代码、名称、交易所）。"""
-    # 用东方财富的全 A 股实时行情接口，代码名称最全
-    df = ak.call_api("stock_zh_a_spot_em", save_raw=True)
-    # 字段：序号、代码、名称、最新价... 只取代码和名称
-    if "代码" not in df.columns or "名称" not in df.columns:
-        raise RuntimeError("stock_zh_a_spot_em 返回字段不符合预期")
+    """获取全 A 股列表（带代码、名称、交易所）。
 
-    out = pd.DataFrame()
-    out["stock_code"] = df["代码"].astype(str).str.zfill(6)
-    out["stock_name"] = df["名称"].astype(str)
-    out["market"] = out["stock_code"].apply(_detect_market)
-    out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
-    logger.info(f"获取到 {len(out)} 只 A 股")
-    return out
+    优先用东方财富（最全），失败则用新浪接口兜底。
+    """
+    last_error = None
+    # 数据源优先级：东方财富 > 新浪
+    for source in ["eastmoney", "sina"]:
+        try:
+            if source == "eastmoney":
+                df = ak.call_api("stock_zh_a_spot_em", save_raw=True)
+                if "代码" not in df.columns or "名称" not in df.columns:
+                    raise RuntimeError("stock_zh_a_spot_em 返回字段不符合预期")
+                out = pd.DataFrame()
+                out["stock_code"] = df["代码"].astype(str).str.zfill(6)
+                out["stock_name"] = df["名称"].astype(str)
+            else:  # sina
+                logger.warning("东方财富接口不可用，改用新浪接口 stock_info_a_code_name")
+                df = ak.call_api("stock_info_a_code_name", save_raw=True)
+                if "code" not in df.columns or "name" not in df.columns:
+                    # 某些版本列名是中文
+                    col_map = _find_columns(df.columns.tolist(), {
+                        "code": ["代码", "code", "股票代码"],
+                        "name": ["名称", "name", "股票名称"],
+                    })
+                    if not col_map.get("code") or not col_map.get("name"):
+                        raise RuntimeError("stock_info_a_code_name 返回字段不符合预期")
+                    out = pd.DataFrame()
+                    out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6)
+                    out["stock_name"] = df[col_map["name"]].astype(str)
+
+            out["market"] = out["stock_code"].apply(_detect_market)
+            out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+            logger.info(f"获取到 {len(out)} 只 A 股（来源: {source}）")
+            return out
+        except Exception as e:
+            last_error = e
+            logger.warning(f"{source} 数据源获取股票列表失败: {e}")
+            continue
+
+    raise RuntimeError(f"所有数据源都获取股票列表失败: {last_error}")
 
 
 def save_stock_list_to_src(df: pd.DataFrame) -> int:

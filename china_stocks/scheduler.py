@@ -229,7 +229,14 @@ def start_scheduler() -> None:
         f"调度器启动，时区 {TIMEZONE}，已注册 {len(scheduler.get_jobs())} 个任务:"
     )
     for job in scheduler.get_jobs():
-        logger.info(f"  - {job.id}: {job.next_run_time}")
+        nxt = getattr(job, "next_run_time", None)
+        if nxt is None and hasattr(job, "_get_run_times"):
+            try:
+                times = job._get_run_times(None)
+                nxt = times[0] if times else None
+            except Exception:
+                nxt = None
+        logger.info(f"  - {job.id}: 下次运行 {nxt or '待触发'}")
 
     try:
         scheduler.start()
