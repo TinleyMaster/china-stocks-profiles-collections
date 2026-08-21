@@ -21,7 +21,11 @@ from .logging_setup import logger
 
 
 def cmd_init_db() -> None:
-    """初始化数据库 schema 和表。"""
+    """初始化数据库 schema 和表。
+
+    逐条执行 SQL 语句，便于定位错误；失败的语句打印告警但不中断，
+    保证尽可能多的表被创建。
+    """
     from pathlib import Path
 
     sql_path = Path(__file__).resolve().parent.parent / "db" / "init.sql"
@@ -30,23 +34,95 @@ def cmd_init_db() -> None:
         sys.exit(1)
 
     sql = sql_path.read_text(encoding="utf-8")
-    # 执行前先建 schema
     from .db import get_engine
     import sqlalchemy
 
     schemas = ["sys", "raw", "src_akshare", "core", "biz"]
     engine = get_engine()
+
+    # 1. 建 schema
     with engine.connect() as conn:
         for schema in schemas:
             conn.execute(sqlalchemy.text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
         conn.commit()
 
-    # 用 sqlalchemy.text 执行整个 SQL 文件
+    # 2. 逐条执行 SQL 语句
+    # 按分号切分，注意：DO $$ ... END $$; 块可能含分号，需要特殊处理
+    statements = _split_sql_statements(sql)
+    success = 0
+    failed = 0
     with engine.connect() as conn:
-        conn.execute(sqlalchemy.text(sql))
-        conn.commit()
+        for i, stmt in enumerate(statements, 1):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            try:
+                conn.execute(sqlalchemy.text(stmt))
+                conn.commit()
+                success += 1
+            except Exception as e:
+                # 失败时回滚当前事务，继续下一条
+                conn.rollback()
+                failed += 1
+                # 截取语句前 80 字方便识别
+                preview = stmt.replace("\n", " ")[:80]
+                logger.warning(f"SQL 语句 #{i} 执行失败（已跳过）: {preview}...  错误: {e}")
 
-    logger.info(f"数据库初始化完成: {db_url()}")
+    logger.info(f"数据库初始化完成: {db_url()}  (成功 {success} 条, 失败 {failed} 条)")
+    if failed > 0:
+        logger.warning(f"有 {failed} 条 SQL 执行失败，请检查上方日志")
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """
+    将 SQL 文件拆分为单条语句。
+    正确处理 DO $$ ... END $$ 这类包含分号的代码块。
+    """
+    statements: list[str] = []
+    lines = sql.splitlines()
+    current: list[str] = []
+    in_do_block = False
+    do_block_depth = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 跳过空行和纯注释行
+        if not stripped or stripped.startswith("--"):
+            current.append(line)
+            continue
+
+        # 检测 DO $$ 开始
+        if stripped.startswith("DO $$") or stripped == "DO $$":
+            in_do_block = True
+            do_block_depth = 1
+            current.append(line)
+            continue
+
+        if in_do_block:
+            current.append(line)
+            # 检测 $$ 结束（简单处理：以 $$; 或 END $$; 结尾）
+            if stripped.endswith("$$;") or stripped.endswith("END $$;"):
+                do_block_depth -= 1
+                if do_block_depth <= 0:
+                    statements.append("\n".join(current))
+                    current = []
+                    in_do_block = False
+            continue
+
+        current.append(line)
+
+        # 普通语句：以分号结尾（且不在字符串中，这里简化处理）
+        if stripped.endswith(";"):
+            statements.append("\n".join(current))
+            current = []
+
+    # 剩余内容（可能没分号）
+    remaining = "\n".join(current).strip()
+    if remaining:
+        statements.append(remaining)
+
+    return statements
 
 
 def cmd_phase_a() -> None:
