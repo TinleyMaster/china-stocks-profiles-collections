@@ -1058,20 +1058,37 @@ def start_web_server(host: str = "0.0.0.0", port: int = 8080) -> Thread:
     """
     在后台线程启动 Flask Web 服务。
     取代旧的 health_server，提供完整 Web 工作台 + 健康检查。
+
+    注意：如果 Web 服务启动失败（端口被占等），会记录错误但不影响主调度器。
     """
 
     def _run():
         try:
-            # 生产环境关闭 debug，用单线程避免 APScheduler 冲突
+            # 生产环境关闭 debug，不用 reloader（避免子进程重复启动调度器）
             app.run(
-                host=host, port=port, debug=False, use_reloader=False, threaded=True
+                host=host,
+                port=port,
+                debug=False,
+                use_reloader=False,
+                threaded=True,
             )
         except Exception as e:
-            logger.error(f"Web 服务启动失败: {e}")
+            logger.error(f"Web 服务启动失败: {e}", exc_info=True)
+            # 给调度器发信号，让主进程也退出（避免 Zeabur 显示假活 502）
+            import os
+
+            os._exit(1)
 
     t = Thread(target=_run, daemon=True, name="web-server")
     t.start()
-    logger.info(f"Web 工作台启动在 http://{host}:{port}")
+    # 给一点启动时间
+    import time
+
+    time.sleep(0.5)
+    if not t.is_alive():
+        logger.error("Web 线程启动后立即退出，服务不可用")
+    else:
+        logger.info(f"Web 工作台启动在 http://{host}:{port}")
     return t
 
 
