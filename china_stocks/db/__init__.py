@@ -7,7 +7,7 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from .config import db_url
+from ..config import db_url
 
 _engine = create_engine(
     db_url(),
