@@ -7,7 +7,7 @@ A 股投研最重要的第三方文本数据，覆盖：
   - 宏观 / 策略报告
 
 策略：
-  - 用 akshare.stock_research_report_em（东财研报中心接口）
+  - 用 akshare_client.fetch_research_reports_by_date（自研直连东财研报中心）
   - 按日期范围拉取，增量更新
   - 写入 biz.doc_source_entry，doc_type = 'research'
   - content_topics 用关键词规则初分（行业/公司/宏观/策略...）
@@ -48,11 +48,7 @@ def fetch_research_by_date(trade_date: str) -> pd.DataFrame:
     akshare 接口：stock_research_report_em
     """
     try:
-        df = ak.call_api(
-            "stock_research_report_em",
-            save_raw=True,
-            date=trade_date,
-        )
+        df = ak.fetch_research_reports_by_date(trade_date, save_raw=True)
         if df.empty:
             logger.info(f"{trade_date} 无研报数据")
             return pd.DataFrame()

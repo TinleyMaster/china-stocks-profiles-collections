@@ -4,7 +4,7 @@ Phase B2：公告入口发现 —— 巨潮资讯网
 A 股最核心的文本数据源，证监会指定信息披露平台。
 
 策略：
-  1. 全市场公告按日期拉取（akshare.stock_notice_cninfo）
+  1. 全市场公告按日期拉取（akshare_client.fetch_announcements_by_date，自研直连东财/巨潮）
   2. 写入 biz.doc_source_entry（公告 URL / 标题 / 分类）
   3. 按 doc_id 去重，支持增量
 
@@ -13,7 +13,7 @@ A 股最核心的文本数据源，证监会指定信息披露平台。
   - 22 类 content_topics 多标签
   - 后续可加 AI L2 精分
 
-注意：akshare 的 cninfo 接口返回巨潮数据，免费但有频率限制。
+注意：公告接口自研直连东财 np-anotice-stock，免费但有频率限制。
 """
 from __future__ import annotations
 
@@ -45,11 +45,7 @@ def fetch_announcements_by_date(
                         股权变动、重大事项、融资公告、风险提示...
     """
     try:
-        df = ak.call_api(
-            "stock_notice_cninfo",
-            save_raw=True,
-            date=trade_date,
-        )
+        df = ak.fetch_announcements_by_date(trade_date, category=category, save_raw=True)
         if df.empty:
             logger.info(f"{trade_date} 无公告数据")
             return pd.DataFrame()

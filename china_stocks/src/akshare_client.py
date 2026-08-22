@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta
 from io import StringIO
 from typing import Any, Callable
 
@@ -321,3 +322,273 @@ def fetch_main_stock_holder(symbol: str) -> pd.DataFrame:
     big_df["股东总数"] = pd.to_numeric(big_df["股东总数"], errors="coerce")
     big_df["平均持股数"] = pd.to_numeric(big_df["平均持股数"], errors="coerce")
     return big_df
+
+
+# ============================================================
+# 自研东财直连（公告 / 研报 / 机构调研）
+#
+# 背景：akshare 1.18.94 对这三组接口做了破坏性变更
+#   - stock_notice_cninfo 已被移除（AttributeError）
+#   - stock_research_report_em 签名改为 (symbol='000001')，不再接受 date 参数（TypeError）
+#   - stock_jgdy_tj_em 签名仍在，但其 datacenter-web 过滤器在部分环境下不稳定
+# 因此改为自研直连东财 API，返回与上层 phase 脚本 _find_columns 期望一致的中文列名
+# DataFrame，最小化改动面。复用项目既有的 Session + 浏览器 UA + 退避重试模式。
+# ============================================================
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _em_get_json(sess: requests.Session, url: str, params: dict, max_try: int = 8) -> dict:
+    """东财接口通用 GET + 退避重试（兼容 SOCKS 代理偶发 TLS 中断）。
+
+    requests.Session 默认读取 HTTP_PROXY/HTTPS_PROXY 环境变量，
+    生产环境直连、本地走代理均无需硬编码。
+    """
+    last_err: Exception | None = None
+    for attempt in range(max_try):
+        try:
+            r = sess.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001 - 网络异常统一退避重试
+            last_err = e
+            time.sleep(1.5 + attempt * 0.5)
+    raise ConnectionError(f"东财接口拉取失败 {url}: {last_err}")
+
+
+def fetch_announcements_by_date(
+    trade_date: str,
+    category: str = "全部",
+    save_raw: bool = True,
+) -> pd.DataFrame:
+    """巨潮资讯/东财-个股公告（自研直连，替代已移除的 akshare.stock_notice_cninfo）。
+
+    返回与 phase_b2_announcements._find_columns 匹配的中文列：
+        股票代码 / 股票简称 / 公告标题 / 公告日期 / 公告类型 / 公告链接
+    trade_date 格式 YYYYMMDD。
+    """
+    ymd = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+    url = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+    base_params = {
+        "sr": "-1",
+        "page_size": "100",
+        "ann_type": "A",
+        "client_source": "web",
+        "stock_list": "",
+        "f_node": "0",
+        "s_node": "0",
+        "date": ymd,
+    }
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": BROWSER_UA})
+
+    rows: list[dict] = []
+    page = 0
+    while page < 100:
+        params = {**base_params, "page_index": str(page)}
+        try:
+            j = _em_get_json(sess, url, params)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"公告拉取失败 date={trade_date} page={page}: {e}")
+            break
+        lst = (j.get("data") or {}).get("list") or []
+        if not lst:
+            break
+        for rec in lst:
+            codes = rec.get("codes") or []
+            if not codes:
+                continue
+            code_info = codes[0]
+            cols = rec.get("columns") or []
+            notice_date = str(rec.get("notice_date") or "")[:10]
+            art_code = rec.get("art_code", "")
+            ann_type_name = cols[0].get("column_name", "") if cols else ""
+            ann_link = (
+                f"https://www.cninfo.com.cn/new/disclosure/detail?"
+                f"announcementId={art_code}&announcementTime={notice_date}"
+            )
+            rows.append({
+                "股票代码": str(code_info.get("stock_code", "")).strip(),
+                "股票简称": str(code_info.get("short_name", "")).strip(),
+                "公告标题": str(rec.get("title", "")).strip(),
+                "公告日期": notice_date,
+                "公告类型": str(ann_type_name).strip(),
+                "公告链接": ann_link,
+            })
+        if len(lst) < 100:
+            break
+        page += 1
+        time.sleep(0.2)
+
+    df = pd.DataFrame(rows)
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="eastmoney",
+                api_name="stock_notice_em",
+                params={"date": trade_date, "category": category},
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存公告 raw 响应失败: {e}")
+    logger.info(f"{trade_date} 公告拉取: {len(df)} 条")
+    return df
+
+
+def fetch_research_reports_by_date(
+    trade_date: str,
+    save_raw: bool = True,
+) -> pd.DataFrame:
+    """东财研报中心（自研直连，替代签名变更的 akshare.stock_research_report_em）。
+
+    返回与 phase_b3_research._find_columns 匹配的中文列：
+        股票代码 / 股票简称 / 报告标题 / 券商 / 发布日期 / 评级 / 研报链接
+    trade_date 格式 YYYYMMDD。
+    """
+    ymd = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+    url = "https://reportapi.eastmoney.com/report/list"
+    base_params = {
+        "industryCode": "*",
+        "pageSize": "100",
+        "industry": "*",
+        "rating": "*",
+        "ratingChange": "*",
+        "beginTime": ymd,
+        "endTime": ymd,
+        "pageNo": "1",
+        "fields": "",
+        "qType": "0",
+    }
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": BROWSER_UA,
+        "Referer": "https://data.eastmoney.com/report/",
+    })
+
+    rows: list[dict] = []
+    page = 1
+    while page < 100:
+        params = {**base_params, "pageNo": str(page)}
+        try:
+            j = _em_get_json(sess, url, params)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"研报拉取失败 date={trade_date} page={page}: {e}")
+            break
+        lst = j.get("data") or []
+        if not lst:
+            break
+        for rec in lst:
+            pub = str(rec.get("publishDate") or "")[:10]
+            info_code = rec.get("infoCode", "")
+            rep_link = (
+                f"https://data.eastmoney.com/report/{pub.replace('-', '')}/{info_code}.html"
+                if info_code else ""
+            )
+            broker = rec.get("orgSName") or rec.get("orgName") or ""
+            rows.append({
+                "股票代码": str(rec.get("stockCode", "")).strip(),
+                "股票简称": str(rec.get("stockName", "")).strip(),
+                "报告标题": str(rec.get("title", "")).strip(),
+                "券商": str(broker).strip(),
+                "发布日期": pub,
+                "评级": str(rec.get("rating") or "").strip(),
+                "研报链接": rep_link,
+            })
+        if len(lst) < 100:
+            break
+        page += 1
+        time.sleep(0.3)
+
+    df = pd.DataFrame(rows)
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="eastmoney",
+                api_name="stock_research_report_em",
+                params={"date": trade_date},
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存研报 raw 响应失败: {e}")
+    logger.info(f"{trade_date} 研报拉取: {len(df)} 条")
+    return df
+
+
+def fetch_survey_stat_by_date(
+    trade_date: str,
+    save_raw: bool = False,
+) -> pd.DataFrame:
+    """东财机构调研统计（自研直连，替代 akshare.stock_jgdy_tj_em）。
+
+    东财 datacenter-web 的 NOTICE_DATE 过滤仅 `>` 生效（= / >= / <= 被忽略），
+    且 `>` 为严格大于会漏掉 trade_date 当天记录，故查询条件用 trade_date 的
+    前一日（> 前一日）以包含当天，再在 Python 侧精确筛出 trade_date 当天记录。
+
+    返回与 phase_b3_survey._find_columns 匹配的中文列：
+        股票代码 / 股票简称 / 公告日期 / 调研方式 / 接待人员 / 接待机构数量
+    trade_date 格式 YYYYMMDD。
+    """
+    prev_ymd = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    base_params = {
+        "sortColumns": "NOTICE_DATE,SUM,RECEIVE_START_DATE,SECURITY_CODE",
+        "sortTypes": "-1,-1,-1,1",
+        "pageSize": "500",
+        "pageNumber": "1",
+        "reportName": "RPT_ORG_SURVEYNEW",
+        "columns": "ALL",
+        "quoteColumns": "f2~01~SECURITY_CODE~CLOSE_PRICE,f3~01~SECURITY_CODE~CHANGE_RATE",
+        "source": "WEB",
+        "client": "WEB",
+        "filter": f"""(NUMBERNEW="1")(IS_SOURCE="1")(NOTICE_DATE>'{prev_ymd}')""",
+    }
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": BROWSER_UA})
+
+    rows: list[dict] = []
+    try:
+        first = _em_get_json(sess, url, base_params)
+        res = first.get("result") or {}
+        total_pages = int(res.get("pages", 1) or 1)
+        pages_data = [res.get("data") or []]
+        for pg in range(2, total_pages + 1):
+            p = {**base_params, "pageNumber": str(pg)}
+            try:
+                j2 = _em_get_json(sess, url, p)
+                pages_data.append((j2.get("result") or {}).get("data") or [])
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"调研分页拉取失败 date={trade_date} page={pg}: {e}")
+                break
+        for pg_data in pages_data:
+            for rec in pg_data:
+                nd = str(rec.get("NOTICE_DATE", ""))[:10].replace("-", "")
+                if nd != trade_date:
+                    continue
+                rows.append({
+                    "股票代码": str(rec.get("SECURITY_CODE", "")).strip(),
+                    "股票简称": str(rec.get("SECURITY_NAME_ABBR", "")).strip(),
+                    "公告日期": str(rec.get("NOTICE_DATE", ""))[:10],
+                    "调研方式": str(rec.get("RECEIVE_WAY_EXPLAIN") or "").strip(),
+                    "接待人员": str(rec.get("RECEPTIONIST") or "").strip(),
+                    "接待机构数量": rec.get("NUM"),
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"调研拉取失败 date={trade_date}: {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="eastmoney",
+                api_name="stock_jgdy_tj_em",
+                params={"date": trade_date},
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存调研 raw 响应失败: {e}")
+    logger.info(f"{trade_date} 调研拉取: {len(df)} 条")
+    return df

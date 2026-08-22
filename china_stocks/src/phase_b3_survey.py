@@ -5,7 +5,7 @@ A 股投研中，调研纪要是最直接反映公司经营近况的一手资料
 
 来源：
   1. 巨潮资讯网的"投资者关系活动记录表"公告（已通过 announcements 采到 biz.doc_source_entry，doc_type='survey'）
-  2. akshare.stock_jgdy_tj_em（东财机构调研统计）
+  2. akshare_client.fetch_survey_stat_by_date（自研直连东财机构调研统计）
 
 策略：
   - 主来源：从已有的 doc_source_entry 中提取 survey 类型（已经在公告采集中覆盖）
@@ -39,11 +39,7 @@ def fetch_survey_stat_by_date(trade_date: str) -> pd.DataFrame:
     akshare 接口：stock_jgdy_tj_em
     """
     try:
-        df = ak.call_api(
-            "stock_jgdy_tj_em",
-            save_raw=False,
-            date=trade_date,
-        )
+        df = ak.fetch_survey_stat_by_date(trade_date, save_raw=False)
         if df.empty:
             return pd.DataFrame()
         logger.info(f"{trade_date} 调研: {len(df)} 条")
