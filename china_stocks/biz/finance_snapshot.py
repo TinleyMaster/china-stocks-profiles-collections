@@ -12,6 +12,7 @@ import time
 from datetime import date as dt_date
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
@@ -74,7 +75,13 @@ def _fetch_finance_one(code: str) -> Optional[dict]:
 
 
 def _flush_finance(results: list[dict]) -> int:
-    """把一批财务指标写入 biz.finance_snapshot（临时表 + upsert）。返回写入条数。"""
+    """把一批财务指标写入 biz.finance_snapshot（临时表 + upsert）。返回写入条数。
+
+    防御性处理（根治旧实现整批报废）：
+    1. inf/-inf → NaN：新浪分母为 0 时产出 inf，pd.to_numeric(errors="coerce") 不拦截；
+    2. 超出 numeric(8,4) 容限(9999.9999) 的极端增长值 → NaN，避免入库 numeric 溢出；
+    3. 批写入异常 → 降级逐只写入，单只坏值跳过并记日志，绝不中断整轮采集。
+    """
     if not results:
         return 0
     df = pd.DataFrame(results)
@@ -83,13 +90,22 @@ def _flush_finance(results: list[dict]) -> int:
     # 数值列强转 float（全 None 列会被 pandas 推断为 TEXT，导致入库类型不匹配）
     numeric_cols = [c for c in df.columns if c not in ("stock_code", "report_date")]
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    # 清 inf（分母为 0 时新浪返回 inf，to_numeric 不拦）
+    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    # 小量程列 numeric(8,4) 超容限置空；revenue/net_profit 为 numeric(18,2) 不裁剪
+    _BIG_COLS = {"revenue", "net_profit"}
+    cap = 9999.0
+    for c in numeric_cols:
+        if c not in _BIG_COLS:
+            df[c] = df[c].where(df[c].abs() <= cap, np.nan)
+
     with get_session() as sess:
         conn = sess.connection()
         df.to_sql(
             "tmp_finance_snapshot", conn, schema="biz",
             if_exists="replace", index=False, method="multi", chunksize=1000,
         )
-        sess.execute(text("""
+        upsert = text("""
             INSERT INTO biz.finance_snapshot
                 (stock_code, report_date, revenue, revenue_yoy, net_profit,
                  net_profit_yoy, roe, roa, gross_margin, net_margin,
@@ -113,9 +129,54 @@ def _flush_finance(results: list[dict]) -> int:
                 eps = EXCLUDED.eps,
                 bps = EXCLUDED.bps,
                 updated_at = NOW()
-        """))
-        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_finance_snapshot"))
+        """)
+        try:
+            sess.execute(upsert)
+        except Exception as e:
+            logger.warning(f"财务批量落盘异常，降级逐只写入: {e}")
+            _flush_finance_fallback(sess, df)
+        finally:
+            sess.execute(text("DROP TABLE IF EXISTS biz.tmp_finance_snapshot"))
     return len(results)
+
+
+def _flush_finance_fallback(sess, df: pd.DataFrame) -> int:
+    """批量 upsert 失败时的逐只兜底：单只坏值跳过，不影响其余。"""
+    sql = text("""
+        INSERT INTO biz.finance_snapshot
+            (stock_code, report_date, revenue, revenue_yoy, net_profit,
+             net_profit_yoy, roe, roa, gross_margin, net_margin,
+             debt_ratio, current_ratio, eps, bps, updated_at)
+        VALUES
+            (:stock_code, :report_date, :revenue, :revenue_yoy, :net_profit,
+             :net_profit_yoy, :roe, :roa, :gross_margin, :net_margin,
+             :debt_ratio, :current_ratio, :eps, :bps, NOW())
+        ON CONFLICT (stock_code) DO UPDATE SET
+            report_date = EXCLUDED.report_date,
+            revenue = EXCLUDED.revenue,
+            revenue_yoy = EXCLUDED.revenue_yoy,
+            net_profit = EXCLUDED.net_profit,
+            net_profit_yoy = EXCLUDED.net_profit_yoy,
+            roe = EXCLUDED.roe,
+            roa = EXCLUDED.roa,
+            gross_margin = EXCLUDED.gross_margin,
+            net_margin = EXCLUDED.net_margin,
+            debt_ratio = EXCLUDED.debt_ratio,
+            current_ratio = EXCLUDED.current_ratio,
+            eps = EXCLUDED.eps,
+            bps = EXCLUDED.bps,
+            updated_at = NOW()
+    """)
+    ok = 0
+    for _, row in df.iterrows():
+        params = {c: (None if pd.isna(v) else v) for c, v in row.items()}
+        try:
+            sess.execute(sql, params)
+            ok += 1
+        except Exception as ex:
+            logger.debug(f"财务逐只写入跳过 {params.get('stock_code')}: {ex}")
+    logger.info(f"财务逐只兜底写入完成: {ok}/{len(df)}")
+    return ok
 
 
 def fetch_and_save_finance(

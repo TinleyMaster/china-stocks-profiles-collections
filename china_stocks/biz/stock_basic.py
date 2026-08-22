@@ -6,7 +6,7 @@ biz 层：stock_basic 画像构建（最新行情 + 估值）
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -17,6 +17,20 @@ from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
+
+
+def _last_trading_day() -> date:
+    """取最近交易日（北京时间，跳过周末）。
+
+    腾讯快照在非交易日返回最近一个交易日的收盘价，若用 DB 的 CURRENT_DATE
+    （且为 UTC）会把周六/周日甚至 UTC 凌晨前的时点标错一天。故 as_of_date
+    不用 CURRENT_DATE，而用最近交易日：先转北京时间，再回退到最近工作日。
+    """
+    bj = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+    d = bj.date()
+    while d.weekday() >= 5:  # 5=周六 6=周日
+        d -= timedelta(days=1)
+    return d
 
 
 def _get_latest_trade_date() -> Optional[date]:
@@ -125,7 +139,9 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
             chunksize=2000,
         )
         # 行情字段（close/change_pct/turnover_rate）已在腾讯快照中取到；
-        # stock_name 来自 core.stock，as_of_date 取采集当日，解除对空 stock_daily 的依赖。
+        # stock_name 来自 core.stock，as_of_date 取最近交易日（北京时间），
+        # 解除对空 stock_daily 的依赖，且避免非交易日/UTC 时区把时点标错一天。
+        as_of_date = _last_trading_day()
         sess.execute(text("""
             INSERT INTO biz.stock_basic
                 (stock_code, stock_name, pe_ttm, pb, close, change_pct,
@@ -135,7 +151,7 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
                 s.stock_name,
                 t.pe_ttm, t.pb, t.close, t.change_pct, t.turnover_rate,
                 t.total_market_cap, t.float_market_cap,
-                CURRENT_DATE, NOW()
+                :as_of_date, NOW()
             FROM biz.tmp_valuation t
             LEFT JOIN core.stock s ON s.stock_code = t.stock_code
             ON CONFLICT (stock_code) DO UPDATE SET
@@ -149,7 +165,7 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
                 float_market_cap = EXCLUDED.float_market_cap,
                 as_of_date = EXCLUDED.as_of_date,
                 updated_at = NOW()
-        """))
+        """), {"as_of_date": as_of_date})
         sess.execute(text("DROP TABLE IF EXISTS biz.tmp_valuation"))
 
     logger.info(f"估值数据写入完成，共 {len(val_df)} 只")
