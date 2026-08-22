@@ -1,26 +1,24 @@
 """
 biz 层：资金面画像 biz.capital_snapshot
 
-A 股特有 Alpha 因子数据源：
-  1. 北向资金持股（沪股通 + 深股通） — 东财接口
-  2. 融资融券余额 — 东财接口
-  3. 龙虎榜 — 标记当日是否上榜
+A 股特有的 Alpha 因子数据源：
+  1. 北向资金持股（沪股通 + 深股通） — 东财接口（2024-08 后港交所停止实时披露，
+     接口可能无数据，失败时跳过不阻塞）
+  2. 融资融券余额 — 上交所/深交所官网源（注意：深交所比上交所晚一天披露）
 
 策略：
 - 北向持股：从 akshare 的沪深港通持股明细里汇总，按个股存最新快照 + 日变动
-- 融资融券：同样日频更新
+- 融资融券：按交易所回溯最近有数据的交易日，全量明细批量写入
 - 全部走 akshare 免费接口，零成本
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Optional
 
 import pandas as pd
 from sqlalchemy import text
 
-from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
@@ -88,227 +86,126 @@ def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
 # 2. 融资融券
 # ============================================================
 
-def fetch_margin_balance() -> pd.DataFrame:
+def _fetch_margin_latest(api_name: str, label: str, lookback: int = 10) -> pd.DataFrame:
+    """从昨天起向前回溯，找最近一个有数据的交易日（交易所官网源）。
+
+    深交所比上交所晚一天披露，周末/节假日也无数据，因此不能写死日期。
     """
-    获取单只股票融资融券余额。
-
-    akshare 有两种方式：
-    - stock_margin_detail_szse / stock_margin_detail_sse（分交易所，按日期）
-    - 这里用东财的个股融资融券数据更方便，但需要逐只拉
-
-    折中方案：用 stock_margin 接口（全市场汇总），再按股票逐个补充
-    —— 实际上 akshare.stock_margin_detail 可以获取全市场明细
-    """
-    try:
-        df = ak.call_api("stock_margin_detail_szse", save_raw=False, date="20240101")
-        # 这个接口返回数据格式可能变化，先用动态列匹配
-        logger.info(f"融资融券明细: {len(df)} 条")
-    except Exception as e:
-        logger.warning(f"融资融券明细接口失败，尝试备用方式: {e}")
-        return pd.DataFrame()
-
-    return df
+    for back in range(1, lookback + 1):
+        d = (date.today() - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            df = ak.call_api(api_name, save_raw=False, date=d)
+        except Exception as e:
+            logger.debug(f"{label}两融 {d} 拉取失败: {e}")
+            continue
+        if df is not None and not df.empty:
+            logger.info(f"{label}两融明细 {d}: {len(df)} 条")
+            return df
+    logger.warning(f"{label}两融明细回溯 {lookback} 天均无数据")
+    return pd.DataFrame()
 
 
 def save_capital_snapshot(north_df: pd.DataFrame, as_of: Optional[date] = None) -> int:
     """
-    将资金面数据写入 biz.capital_snapshot。
-    使用 upsert，缺失字段保留原值。
+    将北向持股数据写入 biz.capital_snapshot。
+    临时表 + 批量 upsert，缺失字段保留原值。
     """
     if north_df.empty:
-        logger.warning("没有资金面数据可写入")
+        logger.warning("没有北向持股数据可写入")
         return 0
 
     if as_of is None:
         as_of = date.today()
 
-    count = 0
+    df = north_df.copy()
+    df["as_of_date"] = as_of
+    df["north_hold_shares"] = pd.to_numeric(df.get("north_hold_shares"), errors="coerce")
+    df["north_hold_pct"] = pd.to_numeric(df.get("north_hold_pct"), errors="coerce")
+
     with get_session() as sess:
-        for _, row in north_df.iterrows():
-            code = row["stock_code"]
-            sess.execute(text("""
-                INSERT INTO biz.capital_snapshot
-                    (stock_code, as_of_date, north_hold_shares, north_hold_pct, updated_at)
-                VALUES
-                    (:code, :as_of, :hold_shares, :hold_pct, NOW())
-                ON CONFLICT (stock_code) DO UPDATE SET
-                    as_of_date = EXCLUDED.as_of_date,
-                    north_hold_shares = EXCLUDED.north_hold_shares,
-                    north_hold_pct = EXCLUDED.north_hold_pct,
-                    updated_at = NOW()
-            """), {
-                "code": code,
-                "as_of": as_of,
-                "hold_shares": _safe_int(row.get("north_hold_shares")),
-                "hold_pct": row.get("north_hold_pct"),
-            })
-            count += 1
-
-    logger.info(f"biz.capital_snapshot 写入/更新 {count} 行")
-    return count
-
-
-# ============================================================
-# 3. 融资融券（个股逐只采集）
-# ============================================================
-
-def _fetch_margin_one(code: str) -> Optional[dict]:
-    """获取单只股票最新融资融券数据。"""
-    try:
-        df = ak.call_api(
-            "stock_margin_detail_sse",
-            save_raw=False,
-            date=date.today().strftime("%Y%m%d"),
+        conn = sess.connection()
+        df.to_sql(
+            "tmp_north_hold", conn, schema="biz",
+            if_exists="replace", index=False, method="multi", chunksize=2000,
         )
-        # 这个接口是全市场明细，按日期的，我们从里面过滤对应股票
-        if df.empty:
-            return None
+        sess.execute(text("""
+            INSERT INTO biz.capital_snapshot
+                (stock_code, as_of_date, north_hold_shares, north_hold_pct, updated_at)
+            SELECT stock_code, CAST(as_of_date AS date), north_hold_shares, north_hold_pct, NOW()
+            FROM biz.tmp_north_hold
+            ON CONFLICT (stock_code) DO UPDATE SET
+                as_of_date = EXCLUDED.as_of_date,
+                north_hold_shares = EXCLUDED.north_hold_shares,
+                north_hold_pct = EXCLUDED.north_hold_pct,
+                updated_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_north_hold"))
 
-        # 找代码列
-        code_col = None
-        for c in df.columns:
-            if "证券代码" in c or "代码" in c:
-                code_col = c
-                break
-        if code_col is None:
-            return None
-
-        row = df[df[code_col].astype(str).str.zfill(6) == code]
-        if row.empty:
-            return None
-
-        row = row.iloc[0]
-        balance_col = None
-        for c in df.columns:
-            if "融资余额" in c:
-                balance_col = c
-                break
-
-        return {
-            "stock_code": code,
-            "margin_balance": _safe_float(row.get(balance_col)) if balance_col else None,
-        }
-    except Exception as e:
-        logger.debug(f"{code} 融资融券获取失败: {e}")
-        return None
+    logger.info(f"biz.capital_snapshot 北向持股写入/更新 {len(df)} 行")
+    return len(df)
 
 
-def fetch_and_save_margin(codes: Optional[list[str]] = None, limit: int = 0) -> int:
+# ============================================================
+# 3. 融资融券（交易所全量明细，批量写入）
+# ============================================================
+
+def fetch_and_save_margin() -> int:
     """
     批量获取融资融券余额并写入。
-    注意：全市场 5000+ 只逐只拉效率低，实际建议用交易所全量数据一次拉取。
-    这里先实现逐只版本，后续可以优化。
+
+    上交所/深交所官网源各一次全量拉取（各约 2000 条），
+    汇总后临时表批量 upsert，秒级完成。
     """
-    if codes is None:
-        codes = get_stock_codes()
-    if limit and limit > 0:
-        codes = codes[:limit]
-
-    results: list[dict] = []
-    logger.info(f"开始采集融资融券: {len(codes)} 只")
-
-    # 尝试一次性全量接口
-    try:
-        # 上交所融资融券明细
-        df_sh = ak.call_api(
-            "stock_margin_detail_sse",
-            save_raw=False,
-            date=date.today().strftime("%Y%m%d"),
-        )
-        if not df_sh.empty:
-            logger.info(f"上交所融资融券明细: {len(df_sh)} 条")
-    except Exception as e:
-        logger.warning(f"上交所融资融券接口失败: {e}")
-        df_sh = pd.DataFrame()
-
-    try:
-        # 深交所融资融券明细
-        df_sz = ak.call_api(
-            "stock_margin_detail_szse",
-            save_raw=False,
-            date=date.today().strftime("%Y%m%d"),
-        )
-        if not df_sz.empty:
-            logger.info(f"深交所融资融券明细: {len(df_sz)} 条")
-    except Exception as e:
-        logger.warning(f"深交所融资融券接口失败: {e}")
-        df_sz = pd.DataFrame()
+    df_sh = _fetch_margin_latest("stock_margin_detail_sse", "上交所")
+    df_sz = _fetch_margin_latest("stock_margin_detail_szse", "深交所")
 
     # 两个接口返回的字段格式差异很大，这里做通用化处理
-    all_data: list[dict] = []
-
-    for df_ in [df_sh, df_sz]:
+    records: list[dict] = []
+    for df_ in (df_sh, df_sz):
         if df_.empty:
             continue
-        cols = df_.columns.tolist()
-        col_map = _find_columns(cols, {
-            "code": ["证券代码", "标的证券代码", "代码"],
-            "balance": ["融资余额", "融资余额(元)"],
+        col_map = _find_columns(df_.columns.tolist(), {
+            "code": ["标的证券代码", "证券代码", "代码"],
+            "balance": ["融资余额(元)", "融资余额"],
         })
         if not col_map.get("code") or not col_map.get("balance"):
+            logger.warning(f"两融明细字段异常: {df_.columns.tolist()}")
             continue
 
-        for _, row in df_.iterrows():
-            code = str(row[col_map["code"]]).zfill(6)
-            if len(code) != 6 or not code.isdigit():
-                continue
-            all_data.append({
-                "stock_code": code,
-                "margin_balance": _safe_float(row[col_map["balance"]]),
-            })
+        part = pd.DataFrame()
+        part["stock_code"] = df_[col_map["code"]].astype(str).str.zfill(6)
+        part["margin_balance"] = pd.to_numeric(df_[col_map["balance"]], errors="coerce")
+        # 过滤非 6 位数字代码
+        part = part[part["stock_code"].str.fullmatch(r"\d{6}")]
+        records.append(part)
 
-    if all_data:
-        with get_session() as sess:
-            for item in all_data:
-                sess.execute(text("""
-                    INSERT INTO biz.capital_snapshot
-                        (stock_code, as_of_date, margin_balance, updated_at)
-                    VALUES
-                        (:code, :as_of, :balance, NOW())
-                    ON CONFLICT (stock_code) DO UPDATE SET
-                        as_of_date = EXCLUDED.as_of_date,
-                        margin_balance = EXCLUDED.margin_balance,
-                        updated_at = NOW()
-                """), {
-                    "code": item["stock_code"],
-                    "as_of": date.today(),
-                    "balance": item["margin_balance"],
-                })
-        logger.info(f"融资融券写入完成: {len(all_data)} 只")
-        return len(all_data)
+    if not records:
+        logger.warning("融资融券数据全部获取失败")
+        return 0
 
-    # 兜底：逐只采集
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_margin_one, code): code for code in codes}
-        for i, fut in enumerate(as_completed(futures), 1):
-            res = fut.result()
-            if res:
-                results.append(res)
-            if i % 200 == 0:
-                logger.info(f"融资融券进度: {i}/{len(codes)}")
+    df = pd.concat(records, ignore_index=True).drop_duplicates(subset=["stock_code"])
+    df["as_of_date"] = date.today()
 
-    if results:
-        with get_session() as sess:
-            for r in results:
-                sess.execute(text("""
-                    INSERT INTO biz.capital_snapshot
-                        (stock_code, as_of_date, margin_balance, updated_at)
-                    VALUES
-                        (:code, :as_of, :balance, NOW())
-                    ON CONFLICT (stock_code) DO UPDATE SET
-                        as_of_date = EXCLUDED.as_of_date,
-                        margin_balance = EXCLUDED.margin_balance,
-                        updated_at = NOW()
-                """), {
-                    "code": r["stock_code"],
-                    "as_of": date.today(),
-                    "balance": r.get("margin_balance"),
-                })
-        logger.info(f"融资融券写入完成: {len(results)} 只")
-        return len(results)
+    with get_session() as sess:
+        conn = sess.connection()
+        df.to_sql(
+            "tmp_margin", conn, schema="biz",
+            if_exists="replace", index=False, method="multi", chunksize=2000,
+        )
+        sess.execute(text("""
+            INSERT INTO biz.capital_snapshot
+                (stock_code, as_of_date, margin_balance, updated_at)
+            SELECT stock_code, CAST(as_of_date AS date), margin_balance, NOW()
+            FROM biz.tmp_margin
+            ON CONFLICT (stock_code) DO UPDATE SET
+                as_of_date = EXCLUDED.as_of_date,
+                margin_balance = EXCLUDED.margin_balance,
+                updated_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_margin"))
 
-    logger.warning("融资融券数据全部获取失败")
-    return 0
+    logger.info(f"融资融券写入完成: {len(df)} 只")
+    return len(df)
 
 
 # ============================================================
@@ -335,21 +232,6 @@ def _to_numeric(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce")
 
 
-def _safe_float(v) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        f = float(v)
-        return f if f == f else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _safe_int(v) -> Optional[int]:
-    f = _safe_float(v)
-    return int(f) if f is not None else None
-
-
 # ============================================================
 # 主入口
 # ============================================================
@@ -373,8 +255,8 @@ def run_capital_snapshot() -> None:
         north_df = fetch_north_holdings()
         north_count = save_capital_snapshot(north_df)
 
-        # 2. 融资融券
-        margin_count = fetch_and_save_margin(codes=stock_codes)
+        # 2. 融资融券（交易所全量明细，无需按个股采集）
+        margin_count = fetch_and_save_margin()
 
         # 三态判定
         status, err_msg = determine_status(
