@@ -26,3 +26,6 @@ logs/
 *.tmp
 *.bak
 workbench/
+
+# macOS
+.DS_Store

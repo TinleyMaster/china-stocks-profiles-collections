@@ -24,6 +24,9 @@ from ..sys import determine_status, finish_run, start_run
 from . import akshare_client as ak
 from .phase_a_stock_pool import get_stock_codes
 
+# 每采集多少只即落库一次（检查点），避免"攒完一次性写"导致内存飙涨 + 一崩全丢
+FLUSH_EVERY = 200
+
 
 def _get_last_trade_date(stock_code: str) -> Optional[date]:
     """获取某股票在库里的最后交易日，用于增量采集。"""
@@ -229,9 +232,22 @@ def fetch_daily(
     total_rows = 0
     success = 0
     failed = 0
-    all_dfs: list[pd.DataFrame] = []
+    buf: list[pd.DataFrame] = []  # 检查点缓冲：攒满 FLUSH_EVERY 只即落库
 
     logger.info(f"开始采集日线行情: {len(stock_codes)} 只股票, 截止 {end_date}")
+
+    def _flush_buf() -> None:
+        """检查点落库：攒满即写，单批异常降级跳过而非中断整轮。"""
+        nonlocal total_rows, failed
+        if not buf:
+            return
+        try:
+            total_rows += _save_daily_batch(pd.concat(buf, ignore_index=True))
+            logger.info(f"检查点落库: +{len(buf)} 只, 累计 {total_rows} 行")
+        except Exception as e:
+            logger.error(f"批量落库失败（本批 {len(buf)} 只跳过）: {e}", exc_info=True)
+            failed += len(buf)
+        buf.clear()
 
     def _task(code: str) -> tuple[str, pd.DataFrame, Optional[str]]:
         try:
@@ -264,16 +280,18 @@ def fetch_daily(
                 continue
 
             if not df.empty:
-                all_dfs.append(df)
+                buf.append(df)
                 success += 1
+
+            # 检查点：攒满 FLUSH_EVERY 只即落库，进度可库证、内存有界
+            if len(buf) >= FLUSH_EVERY:
+                _flush_buf()
 
             if i % 100 == 0:
                 logger.info(f"进度: {i}/{len(stock_codes)}, 成功 {success}, 失败 {failed}")
 
-    # 批量写入
-    if all_dfs:
-        big_df = pd.concat(all_dfs, ignore_index=True)
-        total_rows = _save_daily_batch(big_df)
+    # 末尾剩余缓冲落库
+    _flush_buf()
 
     logger.info(
         f"日线采集完成: 成功 {success}, 失败 {failed}, 写入 {total_rows} 行"

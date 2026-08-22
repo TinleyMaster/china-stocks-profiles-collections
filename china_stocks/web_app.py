@@ -714,10 +714,13 @@ def api_stock_shareholders(code):
     holders = []
     shareholder_count = None
     try:
-        blob = json.loads(row.top10_json) if row.top10_json else {}
+        # top10_json 为 jsonb，psycopg2 已解码为 dict；若是字符串（兜底）再 json.loads
+        raw = row.top10_json
+        blob = raw if isinstance(raw, dict) else (json.loads(raw) if raw else {})
         holders = blob.get("top10_holders", []) or []
         shareholder_count = (blob.get("extra") or {}).get("shareholder_count")
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("股东接口解析 top10_json 失败 stock=%s: %s", code, exc)
         holders = []
 
     return jsonify(
