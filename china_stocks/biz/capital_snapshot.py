@@ -23,7 +23,7 @@ from sqlalchemy import text
 from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
 
@@ -358,20 +358,41 @@ def run_capital_snapshot() -> None:
     """刷新资金面画像（北向 + 融资融券）。"""
     run = start_run(platform_code="akshare", phase="phase_c_capital")
     try:
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可刷新资金面画像",
+            )
+            logger.warning("资金面画像刷新跳过：core.stock 为空")
+            return
+
         # 1. 北向持股
         north_df = fetch_north_holdings()
         north_count = save_capital_snapshot(north_df)
 
         # 2. 融资融券
-        margin_count = fetch_and_save_margin()
+        margin_count = fetch_and_save_margin(codes=stock_codes)
 
-        finish_run(
-            run,
-            status="success",
+        # 三态判定
+        status, err_msg = determine_status(
             rows_inserted=north_count,
             rows_updated=margin_count,
+            expected_min_rows=1,
         )
-        logger.info("资金面画像刷新完成")
+        finish_run(
+            run,
+            status=status,
+            rows_inserted=north_count,
+            rows_updated=margin_count,
+            error_msg=err_msg,
+        )
+        if status != "success":
+            logger.warning(f"资金面画像刷新结束，状态: {status}，原因: {err_msg}")
+        else:
+            logger.info("资金面画像刷新完成")
     except Exception as e:
         logger.exception(f"资金面画像刷新失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

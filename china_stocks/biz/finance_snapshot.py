@@ -17,7 +17,7 @@ from sqlalchemy import text
 from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
 
@@ -152,8 +152,27 @@ def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) ->
 def run_finance_snapshot() -> None:
     run = start_run(platform_code="akshare", phase="phase_c_finance")
     try:
-        count = fetch_and_save_finance()
-        finish_run(run, status="success", rows_inserted=count)
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可刷新财务指标",
+            )
+            logger.warning("财务指标刷新跳过：core.stock 为空")
+            return
+
+        count = fetch_and_save_finance(codes=stock_codes)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=count,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=count, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"财务指标刷新结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"财务指标刷新失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

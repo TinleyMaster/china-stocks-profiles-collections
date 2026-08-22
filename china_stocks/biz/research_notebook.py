@@ -50,7 +50,8 @@ from sqlalchemy import text
 
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
+from ..src.phase_a_stock_pool import get_stock_codes
 
 
 # 完整性清单定义
@@ -364,8 +365,27 @@ def run_build_notebooks(limit: int = 0) -> None:
     """执行全量笔记本构建。"""
     run = start_run(platform_code="local", phase="phase_d_notebook")
     try:
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可构建笔记本",
+            )
+            logger.warning("笔记本构建跳过：core.stock 为空")
+            return
+
         count = build_all_notebooks(limit=limit)
-        finish_run(run, status="success", rows_inserted=count)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=count,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=count, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"笔记本构建结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"笔记本构建失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

@@ -35,7 +35,7 @@ from tenacity import (
 from ..config import MAX_WORKERS, ROOT_DIR
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 
 
 # 数据根目录
@@ -322,10 +322,31 @@ def run_download_announcements(
         target=f"limit={limit}, types={doc_types}",
     )
     try:
+        # 检查上游依赖：biz.doc_source_entry 中 is_downloaded=FALSE 且 url 不为空的记录
+        pending = get_pending_downloads(
+            stock_codes=stock_codes, limit=limit, doc_types=doc_types
+        )
+        if not pending:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="biz.doc_source_entry 中无待下载文档（is_downloaded=FALSE 且 url 不为空）",
+            )
+            logger.warning("公告下载跳过：无待下载文档")
+            return
+
         success, failed = download_announcements(
             stock_codes=stock_codes, limit=limit, doc_types=doc_types
         )
-        finish_run(run, status="success", rows_inserted=success, rows_updated=failed)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=success,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=success, rows_updated=failed, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"公告下载结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"公告下载失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

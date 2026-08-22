@@ -15,7 +15,7 @@ from sqlalchemy import text
 from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -177,9 +177,29 @@ def run_stock_basic() -> None:
     """刷新 biz.stock_basic（行情 + 估值）。"""
     run = start_run(platform_code="akshare", phase="phase_c_stock_basic")
     try:
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可刷新 stock_basic",
+            )
+            logger.warning("stock_basic 刷新跳过：core.stock 为空")
+            return
+
         count = build_stock_basic_from_daily()
-        val_count = fetch_and_save_valuation()
-        finish_run(run, status="success", rows_inserted=count, rows_updated=val_count)
+        val_count = fetch_and_save_valuation(codes=stock_codes)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=count,
+            rows_updated=val_count,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=count, rows_updated=val_count, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"stock_basic 刷新结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"stock_basic 刷新失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

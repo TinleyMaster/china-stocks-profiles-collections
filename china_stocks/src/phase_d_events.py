@@ -28,7 +28,7 @@ from sqlalchemy import text
 from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
 
@@ -424,8 +424,27 @@ def run_corporate_events() -> None:
     """执行公司事件采集。"""
     run = start_run(platform_code="akshare", phase="phase_d_events")
     try:
-        inserted, total = fetch_and_save_events()
-        finish_run(run, status="success", rows_inserted=inserted, rows_updated=total)
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可采集事件",
+            )
+            logger.warning("公司事件采集跳过：core.stock 为空")
+            return
+
+        inserted, total = fetch_and_save_events(codes=stock_codes)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=inserted,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=inserted, rows_updated=total, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"公司事件采集结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"公司事件采集失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

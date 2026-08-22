@@ -21,7 +21,8 @@ from sqlalchemy import text
 
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
+from ..src.phase_a_stock_pool import get_stock_codes
 from .research_notebook import build_notebook_for_stock, list_missing_items
 
 
@@ -229,17 +230,38 @@ def run_fill_notebook(stock_code: str, items: Optional[list[str]] = None) -> Non
     """CLI 入口：执行补齐。"""
     run = start_run(platform_code="local", phase="phase_d_fill", target=stock_code)
     try:
+        # 检查上游依赖：core.stock 是否有数据
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可执行补齐",
+            )
+            logger.warning("笔记本补齐跳过：core.stock 为空")
+            return
+
         result = fill_missing(stock_code, item_keys=items)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=len(result["filled"]),
+            expected_min_rows=1,
+        )
         finish_run(
             run,
-            status="success",
+            status=status,
             rows_inserted=len(result["filled"]),
             rows_updated=len(result["failed"]),
+            error_msg=err_msg,
         )
-        logger.info(
-            f"补齐完成: 成功 {len(result['filled'])}, "
-            f"失败 {len(result['failed'])}, 跳过 {len(result['skipped'])}"
-        )
+        if status != "success":
+            logger.warning(f"笔记本补齐结束，状态: {status}，原因: {err_msg}")
+        else:
+            logger.info(
+                f"补齐完成: 成功 {len(result['filled'])}, "
+                f"失败 {len(result['failed'])}, 跳过 {len(result['skipped'])}"
+            )
     except Exception as e:
         logger.exception(f"补齐失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

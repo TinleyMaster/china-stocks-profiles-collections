@@ -18,7 +18,7 @@ from sqlalchemy import text
 from ..config import WATCHLIST_CODES
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from . import akshare_client as ak
 
 
@@ -52,7 +52,11 @@ def fetch_stock_list() -> pd.DataFrame:
             else:  # sina
                 logger.warning("东方财富接口不可用，改用新浪接口 stock_info_a_code_name")
                 df = ak.call_api("stock_info_a_code_name", save_raw=True)
-                if "code" not in df.columns or "name" not in df.columns:
+                out = pd.DataFrame()
+                if "code" in df.columns and "name" in df.columns:
+                    out["stock_code"] = df["code"].astype(str).str.zfill(6)
+                    out["stock_name"] = df["name"].astype(str)
+                else:
                     # 某些版本列名是中文
                     col_map = _find_columns(df.columns.tolist(), {
                         "code": ["代码", "code", "股票代码"],
@@ -60,7 +64,6 @@ def fetch_stock_list() -> pd.DataFrame:
                     })
                     if not col_map.get("code") or not col_map.get("name"):
                         raise RuntimeError("stock_info_a_code_name 返回字段不符合预期")
-                    out = pd.DataFrame()
                     out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6)
                     out["stock_name"] = df[col_map["name"]].astype(str)
 
@@ -301,13 +304,25 @@ def run_phase_a() -> None:
         # 3. 刷新 core.stock
         inserted, updated = refresh_core_stock()
 
+        # 三态判定：Phase A 是源头，写入行数为 0 说明异常
+        total_rows = inserted + list_count + sw_count
+        status, err_msg = determine_status(
+            rows_inserted=total_rows,
+            rows_updated=updated,
+            expected_min_rows=100,  # A 股至少上百只才算正常
+        )
+
         finish_run(
             run,
-            status="success",
+            status=status,
             rows_inserted=inserted + list_count + sw_count,
             rows_updated=updated,
+            error_msg=err_msg,
         )
-        logger.info("Phase A 执行成功")
+        if status == "success":
+            logger.info("Phase A 执行成功")
+        else:
+            logger.warning(f"Phase A 执行结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"Phase A 执行失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

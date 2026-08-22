@@ -40,6 +40,25 @@ app.config["JSON_AS_ASCII"] = False  # 中文正常显示
 
 
 # ============================================================
+# 全局响应钩子：安全头 + 隐藏 Server 版本
+# ============================================================
+
+
+@app.after_request
+def _secure_headers(response):
+    # 隐藏 Werkzeug/Python 版本信息，避免指纹识别
+    response.headers["Server"] = "web"
+    # 基础安全响应头
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # HSTS（HTTPS 环境下生效）
+    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+# ============================================================
 # API: 仪表盘
 # ============================================================
 
@@ -108,6 +127,7 @@ def api_stats():
             "downloaded_docs": downloaded_docs,
             "total_chunks": total_chunks,
             "total_notebooks": total_notebooks,
+            "data_ready": total_stocks > 0,  # 数据就绪标志
             "recent_runs": [
                 {
                     "run_id": r.run_id,
@@ -184,25 +204,74 @@ def api_screener():
       - sort_order: asc / desc
       - page / page_size: 分页
     """
-    # 解析参数
-    industry_l1 = request.args.get("industry_l1", "").strip() or None
-    industry_l2 = request.args.get("industry_l2", "").strip() or None
-    min_cap = request.args.get("min_cap", type=float)
-    max_cap = request.args.get("max_cap", type=float)
-    min_pe = request.args.get("min_pe", type=float)
-    max_pe = request.args.get("max_pe", type=float)
-    min_pb = request.args.get("min_pb", type=float)
-    max_pb = request.args.get("max_pb", type=float)
-    min_change = request.args.get("min_change", type=float)
-    max_change = request.args.get("max_change", type=float)
-    min_roe = request.args.get("min_roe", type=float)
-    max_roe = request.args.get("max_roe", type=float)
-    min_turnover = request.args.get("min_turnover", type=float)
-    max_turnover = request.args.get("max_turnover", type=float)
-    sort_by = request.args.get("sort_by", "market_cap")
-    sort_order = request.args.get("sort_order", "desc")
-    page = max(1, request.args.get("page", 1, type=int))
-    page_size = min(100, request.args.get("page_size", 30, type=int))
+    # ---------- 参数校验辅助 ----------
+    def _parse_float(name: str) -> float | None:
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return None
+        try:
+            val = float(raw)
+        except (ValueError, TypeError):
+            raise _ParamError(f"{name} 必须是数字，收到: {raw!r}")
+        return val
+
+    def _parse_int(name: str, default: int) -> int:
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = int(raw)
+        except (ValueError, TypeError):
+            raise _ParamError(f"{name} 必须是整数，收到: {raw!r}")
+        return val
+
+    class _ParamError(Exception):
+        pass
+
+    # ---------- 解析参数 ----------
+    try:
+        industry_l1 = request.args.get("industry_l1", "").strip() or None
+        industry_l2 = request.args.get("industry_l2", "").strip() or None
+        min_cap = _parse_float("min_cap")
+        max_cap = _parse_float("max_cap")
+        min_pe = _parse_float("min_pe")
+        max_pe = _parse_float("max_pe")
+        min_pb = _parse_float("min_pb")
+        max_pb = _parse_float("max_pb")
+        min_change = _parse_float("min_change")
+        max_change = _parse_float("max_change")
+        min_roe = _parse_float("min_roe")
+        max_roe = _parse_float("max_roe")
+        min_turnover = _parse_float("min_turnover")
+        max_turnover = _parse_float("max_turnover")
+        sort_by = request.args.get("sort_by", "market_cap")
+        sort_order = request.args.get("sort_order", "desc")
+        page = _parse_int("page", 1)
+        page_size = _parse_int("page_size", 30)
+
+        # 范围校验
+        if page < 1:
+            raise _ParamError(f"page 必须 >= 1，收到: {page}")
+        if page_size < 1 or page_size > 100:
+            raise _ParamError(f"page_size 必须在 1~100 之间，收到: {page_size}")
+        if sort_order not in ("asc", "desc"):
+            raise _ParamError(f"sort_order 必须是 asc 或 desc，收到: {sort_order!r}")
+
+        # 数值范围合理性校验（min <= max）
+        range_pairs = [
+            ("cap", min_cap, max_cap),
+            ("pe", min_pe, max_pe),
+            ("pb", min_pb, max_pb),
+            ("change", min_change, max_change),
+            ("roe", min_roe, max_roe),
+            ("turnover", min_turnover, max_turnover),
+        ]
+        for name, lo, hi in range_pairs:
+            if lo is not None and hi is not None and lo > hi:
+                raise _ParamError(f"min_{name} 不能大于 max_{name}（{lo} > {hi}）")
+    except _ParamError as e:
+        return jsonify({"error": str(e)}), 400
+
     offset = (page - 1) * page_size
 
     # 允许的排序字段
@@ -295,6 +364,11 @@ def api_screener():
     params["offset"] = offset
 
     with get_session() as sess:
+        # 先判断系统是否有数据（用于前端区分"无数据"与"无结果"）
+        has_data = (
+            sess.execute(text("SELECT COUNT(*) FROM core.stock LIMIT 1")).scalar() or 0
+        ) > 0
+
         total = sess.execute(text(count_sql), params).scalar() or 0
         rows = sess.execute(text(data_sql), params).fetchall()
 
@@ -326,6 +400,7 @@ def api_screener():
             "total": total,
             "page": page,
             "page_size": page_size,
+            "has_data": has_data,
         }
     )
 
@@ -516,13 +591,19 @@ def api_stock_kline(code):
     """
     获取股票日线K线数据。
     支持 ?period=  参数：
-      - period: 天数，默认 120 天
+      - period: 天数，默认 120 天，范围 1~1000
     返回 ECharts 友好格式：[[日期, 开, 收, 低, 高, 成交量, ...], ...]
     """
     code = code.zfill(6)
-    period = int(request.args.get("period", 120))
-    if period > 1000:
-        period = 1000
+
+    # 参数校验
+    period_raw = request.args.get("period", "120")
+    try:
+        period = int(period_raw)
+    except (ValueError, TypeError):
+        return jsonify({"error": f"period 参数必须是整数，收到: {period_raw!r}"}), 400
+    if period < 1 or period > 1000:
+        return jsonify({"error": f"period 参数范围必须在 1~1000 之间，收到: {period}"}), 400
 
     with get_session() as sess:
         rows = sess.execute(
@@ -1072,14 +1153,27 @@ def start_web_server(host: str = "0.0.0.0", port: int = 8080) -> Thread:
 
     def _run():
         try:
-            # 生产环境关闭 debug，不用 reloader（避免子进程重复启动调度器）
-            app.run(
-                host=host,
-                port=port,
-                debug=False,
-                use_reloader=False,
-                threaded=True,
-            )
+            # 优先使用 waitress（生产级 WSGI 服务器），不可用时回退到 Flask 内置
+            try:
+                from waitress import serve
+
+                logger.info("使用 waitress 生产级 WSGI 服务器")
+                serve(
+                    app,
+                    host=host,
+                    port=port,
+                    threads=8,
+                    ident="web",  # 隐藏 Server 头版本信息
+                )
+            except ImportError:
+                logger.warning("waitress 未安装，回退到 Flask 内置开发服务器")
+                app.run(
+                    host=host,
+                    port=port,
+                    debug=False,
+                    use_reloader=False,
+                    threaded=True,
+                )
         except Exception as e:
             logger.error(f"Web 服务启动失败: {e}", exc_info=True)
             # 给调度器发信号，让主进程也退出（避免 Zeabur 显示假活 502）
@@ -1268,7 +1362,13 @@ function fmtPct(v) {
 }
 
 function statusTag(status) {
-  const map = { success: 'tag-success', running: 'tag-info', failed: 'tag-error' };
+  const map = {
+    success: 'tag-success',
+    running: 'tag-info',
+    failed: 'tag-error',
+    warning: 'tag-warning',
+    skipped: 'tag-gray',
+  };
   const cls = map[status] || 'tag-gray';
   return `<span class="tag ${cls}">${status}</span>`;
 }
@@ -1280,6 +1380,26 @@ function docTypeLabel(type) {
     prospectus: '招股书', listing: '上市公告', other: '其他',
   };
   return map[type] || type;
+}
+
+// 将 UTC 时间字符串转为北京时间（Asia/Shanghai, UTC+8）
+// 输入格式: "2026-08-22 00:30:00" 或 ISO 格式
+function formatBJT(dateStr, withTime = true) {
+  if (!dateStr) return '-';
+  // 兼容 "YYYY-MM-DD HH:MM:SS" 格式，替换为 ISO 可解析格式
+  const isoStr = dateStr.replace(' ', 'T') + 'Z'; // 标记为 UTC
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return dateStr;
+  // 北京时间 = UTC + 8 小时
+  const bjt = new Date(d.getTime() + 8 * 3600 * 1000);
+  const y = bjt.getUTCFullYear();
+  const m = String(bjt.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(bjt.getUTCDate()).padStart(2, '0');
+  if (!withTime) return `${y}-${m}-${day}`;
+  const h = String(bjt.getUTCHours()).padStart(2, '0');
+  const min = String(bjt.getUTCMinutes()).padStart(2, '0');
+  const s = String(bjt.getUTCSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${h}:${min}:${s}`;
 }
 
 // ============================================================
@@ -1296,6 +1416,25 @@ async function renderDashboard() {
 
   content.innerHTML = `
     <h2 class="text-2xl font-bold mb-6">仪表盘</h2>
+
+    <!-- 数据就绪度横幅 -->
+    ${data.data_ready ? '' : `
+      <div class="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+        <div class="flex items-start gap-3">
+          <div class="text-2xl">⚠️</div>
+          <div>
+            <div class="font-bold text-yellow-800">系统尚无数据，采集未完成</div>
+            <div class="text-sm text-yellow-700 mt-1">
+              当前股票池为空（0 只），所有投研功能暂不可用。请检查采集任务状态，
+              或前往"采集任务"页面手动触发。
+            </div>
+            ${data.recent_runs && data.recent_runs.length > 0 && data.recent_runs[0].status === 'failed'
+              ? `<div class="text-sm text-red-600 mt-2">最近一次失败原因：${data.recent_runs[0].error_msg || '未知错误'}</div>`
+              : ''}
+          </div>
+        </div>
+      </div>
+    `}
 
     <!-- 统计卡片 -->
     <div class="grid grid-cols-4 gap-4 mb-8">
@@ -1330,7 +1469,7 @@ async function renderDashboard() {
             <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
               <div>
                 <div class="font-medium text-sm">${r.phase}</div>
-                <div class="text-xs text-gray-400 mt-1">${r.started_at ? r.started_at.slice(0, 19) : '-'} · 耗时 ${r.cost_seconds?.toFixed(1) || 0}s</div>
+                <div class="text-xs text-gray-400 mt-1">${formatBJT(r.started_at)} · 耗时 ${r.cost_seconds?.toFixed(1) || 0}s</div>
               </div>
               <div class="text-right">
                 ${statusTag(r.status)}
@@ -1644,6 +1783,15 @@ async function searchDocs() {
   resultsDiv.innerHTML = '<div class="flex items-center justify-center gap-2 py-8"><span class="loading"></span> 检索中...</div>';
 
   const data = await api(`/api/docs/search?code=${code}&q=${encodeURIComponent(q)}`);
+
+  if (data.error) {
+    resultsDiv.innerHTML = `
+      <div class="text-center py-8">
+        <div class="text-red-500 font-medium">检索失败：${data.error}</div>
+        <div class="text-sm text-gray-400 mt-2">服务异常，请稍后重试或联系管理员</div>
+      </div>`;
+    return;
+  }
 
   if (!data.results || data.results.length === 0) {
     resultsDiv.innerHTML = '<div class="text-gray-400 text-center py-8">没有找到匹配的文档</div>';
@@ -2281,7 +2429,16 @@ async function runScreener(page = 1) {
 function renderScreenerResults(data) {
   const resultsDiv = document.getElementById('screener-results');
   if (!data.results || data.results.length === 0) {
-    resultsDiv.innerHTML = '<div class="text-center text-gray-400 py-12">没有找到符合条件的股票</div>';
+    if (data.has_data === false) {
+      resultsDiv.innerHTML = `
+        <div class="text-center py-12">
+          <div class="text-4xl mb-3">⚠️</div>
+          <div class="text-lg font-medium text-yellow-700">系统尚无数据，采集未完成</div>
+          <div class="text-sm text-gray-500 mt-2">当前股票池为空，所有筛选条件均无法生效。请先完成数据采集。</div>
+        </div>`;
+    } else {
+      resultsDiv.innerHTML = '<div class="text-center text-gray-400 py-12">没有找到符合条件的股票</div>';
+    }
     return;
   }
 
@@ -2510,7 +2667,7 @@ async function renderTasks() {
                 <div>
                   <div class="font-medium text-sm">${r.phase}</div>
                   <div class="text-xs text-gray-400 mt-1">
-                    ${r.started_at ? r.started_at.slice(5, 19) : '-'} · 耗时 ${r.cost_seconds?.toFixed(1) || 0}s
+                    ${formatBJT(r.started_at)} · 耗时 ${r.cost_seconds?.toFixed(1) || 0}s
                   </div>
                 </div>
                 <div class="text-right">

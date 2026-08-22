@@ -339,6 +339,25 @@ CREATE TABLE IF NOT EXISTS biz.watchlist (
 CREATE INDEX IF NOT EXISTS idx_watchlist_added ON biz.watchlist(added_at DESC);
 
 -- ============================================================
+-- 选股性能索引（多条件筛选常用字段）
+-- ============================================================
+-- core.stock 行业索引
+CREATE INDEX IF NOT EXISTS idx_core_stock_industry_l1 ON core.stock(primary_industry_l1);
+CREATE INDEX IF NOT EXISTS idx_core_stock_industry_l2 ON core.stock(primary_industry_l2);
+
+-- biz.stock_basic 估值/行情索引（选股高频字段）
+CREATE INDEX IF NOT EXISTS idx_stock_basic_market_cap ON biz.stock_basic(total_market_cap);
+CREATE INDEX IF NOT EXISTS idx_stock_basic_pe ON biz.stock_basic(pe_ttm);
+CREATE INDEX IF NOT EXISTS idx_stock_basic_pb ON biz.stock_basic(pb);
+CREATE INDEX IF NOT EXISTS idx_stock_basic_change ON biz.stock_basic(change_pct);
+CREATE INDEX IF NOT EXISTS idx_stock_basic_turnover ON biz.stock_basic(turnover_rate);
+
+-- biz.finance_snapshot 财务索引
+CREATE INDEX IF NOT EXISTS idx_finance_snapshot_roe ON biz.finance_snapshot(roe);
+CREATE INDEX IF NOT EXISTS idx_finance_snapshot_revenue_yoy ON biz.finance_snapshot(revenue_yoy);
+CREATE INDEX IF NOT EXISTS idx_finance_snapshot_net_profit_yoy ON biz.finance_snapshot(net_profit_yoy);
+
+-- ============================================================
 -- 6. 初始化来源平台
 -- ============================================================
 INSERT INTO sys.source_platform (platform_code, platform_name, base_url, is_free, remark) VALUES

@@ -20,7 +20,7 @@ from sqlalchemy import text
 from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 from . import akshare_client as ak
 from .phase_a_stock_pool import get_stock_codes
 
@@ -215,8 +215,28 @@ def run_phase_daily(
     target = ",".join(stock_codes[:5]) + ("..." if stock_codes and len(stock_codes) > 5 else "")
     run = start_run(platform_code="akshare", phase="phase_b_daily", target=target or "all")
     try:
+        # 检查上游依赖：core.stock 是否有数据
+        if stock_codes is None:
+            stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="core.stock 为空，无股票可采集日线",
+            )
+            logger.warning("日线采集跳过：core.stock 为空")
+            return
+
         success, rows = fetch_daily(stock_codes=stock_codes, incremental=incremental)
-        finish_run(run, status="success", rows_inserted=rows)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=rows,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=rows, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"日线采集结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"日线采集失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

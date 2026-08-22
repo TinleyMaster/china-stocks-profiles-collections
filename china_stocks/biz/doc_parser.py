@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 from ..db import get_session
 from ..logging_setup import logger
-from ..sys import finish_run, start_run
+from ..sys import determine_status, finish_run, start_run
 
 # 尝试导入可选依赖
 try:
@@ -542,12 +542,36 @@ def run_parse_docs(
         target=f"limit={limit}, types={doc_types}",
     )
     try:
+        # 检查上游依赖：biz.doc_source_entry 中 is_downloaded=TRUE 的记录
+        with get_session() as sess:
+            downloaded_count = sess.execute(text("""
+                SELECT COUNT(*) FROM biz.doc_source_entry
+                WHERE is_downloaded = TRUE AND file_path IS NOT NULL
+            """)).fetchone()[0]
+        if downloaded_count == 0:
+            finish_run(
+                run,
+                status="skipped",
+                error_msg="biz.doc_source_entry 中无已下载文档（is_downloaded=TRUE）",
+            )
+            logger.warning("文档解析跳过：无已下载文档")
+            return
+
         docs, chunks = parse_docs(
             stock_codes=stock_codes,
             limit=limit,
             doc_types=doc_types,
         )
-        finish_run(run, status="success", rows_inserted=docs, rows_updated=chunks)
+
+        # 三态判定
+        status, err_msg = determine_status(
+            rows_inserted=docs,
+            rows_updated=chunks,
+            expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=docs, rows_updated=chunks, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"文档解析结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"文档解析失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))

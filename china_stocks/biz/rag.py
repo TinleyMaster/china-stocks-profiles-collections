@@ -143,7 +143,7 @@ def keyword_search_chunks(
         )
         params[f"kw{i}"] = f"%{kw}%"
 
-    hit_expr = " + ".join(hit_expr_parts) + " AS hit_count"
+    hit_expr = " + ".join(hit_expr_parts) + " AS hit_count,"
     sql_parts.insert(1, hit_expr)
 
     # 至少命中一个关键词
