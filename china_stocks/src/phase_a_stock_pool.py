@@ -98,31 +98,109 @@ def save_stock_list_to_src(df: pd.DataFrame) -> int:
     return len(df)
 
 
-def fetch_sw_industry() -> pd.DataFrame:
-    """获取申万行业分类（新版接口）。"""
+# 申万一级行业（31 个，2021 版）——作为 legulegu 分类接口失败时的硬编码兜底
+_SW_L1_INDUSTRIES: list[tuple[str, str]] = [
+    ("801010", "农林牧渔"),
+    ("801030", "基础化工"),
+    ("801040", "钢铁"),
+    ("801050", "有色金属"),
+    ("801080", "电子"),
+    ("801880", "汽车"),
+    ("801110", "家用电器"),
+    ("801120", "食品饮料"),
+    ("801130", "纺织服饰"),
+    ("801140", "轻工制造"),
+    ("801150", "医药生物"),
+    ("801160", "公用事业"),
+    ("801170", "交通运输"),
+    ("801180", "房地产"),
+    ("801200", "商贸零售"),
+    ("801210", "社会服务"),
+    ("801780", "银行"),
+    ("801790", "非银金融"),
+    ("801230", "综合"),
+    ("801710", "建筑材料"),
+    ("801720", "建筑装饰"),
+    ("801730", "电力设备"),
+    ("801890", "机械设备"),
+    ("801740", "国防军工"),
+    ("801750", "计算机"),
+    ("801760", "传媒"),
+    ("801770", "通信"),
+    ("801950", "煤炭"),
+    ("801960", "石油石化"),
+    ("801970", "环保"),
+    ("801980", "美容护理"),
+]
+
+
+def _fetch_sw_l1_list() -> list[tuple[str, str]]:
+    """获取申万一级行业列表 (代码, 名称)。legulegu 失败则硬编码兜底。"""
     try:
         df = ak.call_api("sw_index_first_info", save_raw=True)
-        # 尝试不同的 akshare 接口名（版本差异大，兼容）
-    except Exception:
-        # 兜底：从行业成分股接口逐个拼
-        logger.warning("sw_index_first_info 调用失败，尝试用 stock_board_industry_name_em 兜底")
-        df = ak.call_api("stock_board_industry_name_em", save_raw=False)
+        result: list[tuple[str, str]] = []
+        for _, row in df.iterrows():
+            code = str(row["行业代码"]).split(".")[0].strip()
+            name = str(row["行业名称"]).strip()
+            if code and name:
+                result.append((code, name))
+        if result:
+            logger.info(f"申万一级行业分类获取成功: {len(result)} 个")
+            return result
+    except Exception as e:
+        logger.warning(f"sw_index_first_info 失败，改用硬编码兜底: {e}")
 
-    # 字段名因 akshare 版本差异很大，尝试匹配常见命名
-    col_map = _find_columns(df.columns.tolist(), {
-        "code": ["代码", "股票代码", "stock_code"],
-        "name": ["名称", "股票名称", "stock_name"],
-        "l1": ["申万一级", "一级行业", "行业", "板块名称", "行业名称"],
-        "l2": ["申万二级", "二级行业"],
-        "l3": ["申万三级", "三级行业"],
-    })
+    logger.info(f"使用硬编码申万一级行业: {len(_SW_L1_INDUSTRIES)} 个")
+    return list(_SW_L1_INDUSTRIES)
 
-    out = pd.DataFrame()
-    out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6) if col_map.get("code") else ""
-    out["stock_name"] = df[col_map["name"]].astype(str) if col_map.get("name") else ""
-    out["industry_l1"] = df[col_map["l1"]].astype(str) if col_map.get("l1") else ""
-    out["industry_l2"] = df[col_map["l2"]].astype(str) if col_map.get("l2") else None
-    out["industry_l3"] = df[col_map["l3"]].astype(str) if col_map.get("l3") else None
+
+def fetch_sw_industry() -> pd.DataFrame:
+    """获取申万一级行业成分股 → 股票-行业映射。
+
+    流程：先拿一级行业列表，再逐个行业拉成分股（index_component_sw，申万宏源源，稳定），
+    汇总成 stock_code → industry_l1 映射。l2/l3 暂留空（后续可用三级行业接口补全）。
+    """
+    l1_list = _fetch_sw_l1_list()
+    if not l1_list:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    for code, name in l1_list:
+        try:
+            cons = ak.call_api("index_component_sw", save_raw=False, symbol=code)
+            if cons.empty:
+                logger.warning(f"申万一级行业 {code} {name} 无成分股")
+                continue
+
+            col_map = _find_columns(cons.columns.tolist(), {
+                "code": ["证券代码", "股票代码", "代码", "code"],
+                "name": ["证券名称", "股票名称", "名称", "name"],
+            })
+            if not col_map.get("code"):
+                logger.warning(f"申万一级行业 {code} {name} 字段无法识别: {list(cons.columns)}")
+                continue
+
+            sub = pd.DataFrame()
+            sub["stock_code"] = cons[col_map["code"]].astype(str).str.zfill(6)
+            sub["stock_name"] = (
+                cons[col_map["name"]].astype(str)
+                if col_map.get("name")
+                else cons[col_map["code"]].astype(str).str.zfill(6)
+            )
+            sub["industry_l1"] = name
+            sub["industry_l2"] = None
+            sub["industry_l3"] = None
+            frames.append(sub)
+        except Exception as e:
+            logger.warning(f"申万一级行业 {code} {name} 成分股拉取失败: {e}")
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    # 申万一级行业互斥，但保险起见按股票代码去重（保留首个）
+    out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+    logger.info(f"申万行业成分股汇总: {len(out)} 只股票覆盖 {len(l1_list)} 个一级行业")
     return out
 
 
@@ -142,23 +220,22 @@ def _find_columns(columns: list[str], mapping: dict[str, list[str]]) -> dict[str
 
 
 def save_sw_industry_to_src(df: pd.DataFrame) -> int:
-    """写入申万行业快照。"""
+    """写入申万行业快照（pandas to_sql + multi 批量）。"""
+    if df.empty:
+        return 0
     with get_session() as sess:
         sess.execute(text("TRUNCATE TABLE src_akshare.sw_industry"))
-        rows = df.to_dict(orient="records")
-        if not rows:
-            return 0
-        sess.execute(
-            text("""
-                INSERT INTO src_akshare.sw_industry
-                    (stock_code, stock_name, industry_l1, industry_l2, industry_l3)
-                VALUES
-                    (:stock_code, :stock_name, :industry_l1, :industry_l2, :industry_l3)
-            """),
-            rows,
+        df[["stock_code", "stock_name", "industry_l1", "industry_l2", "industry_l3"]].to_sql(
+            "sw_industry",
+            sess.connection(),
+            schema="src_akshare",
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
         )
-    logger.info(f"src_akshare.sw_industry 写入 {len(rows)} 行")
-    return len(rows)
+    logger.info(f"src_akshare.sw_industry 写入 {len(df)} 行")
+    return len(df)
 
 
 def refresh_core_stock() -> tuple[int, int]:
