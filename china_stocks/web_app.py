@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date
 from threading import Thread
 from typing import Optional
 
@@ -260,6 +261,13 @@ def api_screener():
         max_roe = _parse_float("max_roe")
         min_turnover = _parse_float("min_turnover")
         max_turnover = _parse_float("max_turnover")
+        # 仅看已出中报：过滤掉报告期仍为一季报的股票，规避横截面对比失真
+        only_interim = request.args.get("only_interim", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         sort_by = request.args.get("sort_by", "market_cap")
         sort_order = request.args.get("sort_order", "desc")
         page = _parse_int("page", 1)
@@ -349,6 +357,11 @@ def api_screener():
     if max_turnover is not None:
         conditions.append("b.turnover_rate <= :max_turnover")
         params["max_turnover"] = max_turnover
+    if only_interim:
+        # 中报报告期为当年 06-30；过滤掉报告期更早（仍为一季报）的股票
+        interim_date = f"{date.today().year}-06-30"
+        conditions.append("f.report_date >= :interim_date")
+        params["interim_date"] = interim_date
 
     where_sql = ""
     if conditions:
@@ -369,7 +382,8 @@ def api_screener():
                s.primary_industry_l1 AS industry_l1,
                s.primary_industry_l2 AS industry_l2,
                b.close, b.change_pct, b.total_market_cap, b.pe_ttm, b.pb,
-               b.turnover_rate, f.roe, f.revenue_yoy, f.net_profit_yoy
+               b.turnover_rate, f.roe, f.revenue_yoy, f.net_profit_yoy,
+               f.report_date
         FROM core.stock s
         LEFT JOIN biz.stock_basic b ON b.stock_code = s.stock_code
         LEFT JOIN biz.finance_snapshot f ON f.stock_code = s.stock_code
@@ -408,6 +422,7 @@ def api_screener():
                 "roe": float(r.roe) if r.roe else None,
                 "revenue_yoy": float(r.revenue_yoy) if r.revenue_yoy else None,
                 "net_profit_yoy": float(r.net_profit_yoy) if r.net_profit_yoy else None,
+                "report_date": str(r.report_date) if r.report_date else None,
             }
         )
 
@@ -418,6 +433,10 @@ def api_screener():
             "page": page,
             "page_size": page_size,
             "has_data": has_data,
+            "finance_note": (
+                "财务指标取各股最新报告期，当前横截面可能混含一季报与中报，"
+                "直接对比有偏差；勾选「仅看已出中报」可只看已披露中报的个股。"
+            ),
         }
     )
 
@@ -671,6 +690,61 @@ def api_stock_kline(code):
             "period": period,
             "count": len(data),
             "data": data,
+        }
+    )
+
+
+@app.route("/api/stock/<code>/shareholders")
+def api_stock_shareholders(code):
+    """股东画像：十大股东 + 股东户数 + 机构持股。质押率数据源未提供，固定为 None。"""
+    code = code.zfill(6)
+
+    with get_session() as sess:
+        row = sess.execute(
+            text("""
+            SELECT report_date, top10_json, inst_hold_pct, pledge_pct, updated_at
+            FROM biz.shareholder_snapshot WHERE stock_code = :code
+        """),
+            {"code": code},
+        ).fetchone()
+
+    if not row:
+        return jsonify({"stock_code": code, "has_data": False})
+
+    holders = []
+    shareholder_count = None
+    try:
+        blob = json.loads(row.top10_json) if row.top10_json else {}
+        holders = blob.get("top10_holders", []) or []
+        shareholder_count = (blob.get("extra") or {}).get("shareholder_count")
+    except (json.JSONDecodeError, TypeError):
+        holders = []
+
+    return jsonify(
+        {
+            "stock_code": code,
+            "has_data": True,
+            "report_date": str(row.report_date) if row.report_date else None,
+            "shareholder_count": int(shareholder_count) if shareholder_count is not None else None,
+            "inst_hold_pct": float(row.inst_hold_pct)
+            if row.inst_hold_pct is not None
+            else None,
+            # 质押率：新浪单接口不提供，始终为 None，前端需标注「暂无数据」
+            "pledge_pct": None,
+            "pledge_note": "质押率数据源未提供（新浪股东接口不含质押信息），暂无法展示",
+            "top10": [
+                {
+                    "name": h.get("name"),
+                    "hold_shares": float(h.get("hold_shares"))
+                    if h.get("hold_shares") is not None
+                    else None,
+                    "hold_pct": float(h.get("hold_pct"))
+                    if h.get("hold_pct") is not None
+                    else None,
+                }
+                for h in holders
+            ],
+            "updated_at": str(row.updated_at) if row.updated_at else None,
         }
     )
 
@@ -966,7 +1040,7 @@ def api_tasks_list():
         {
             "id": "shareholder",
             "name": "Phase C: 股东画像",
-            "desc": "十大股东 + 质押 + 户数",
+            "desc": "十大股东 + 股东户数 + 机构持股估算（质押率数据源未提供，暂无法展示）",
         },
         {
             "id": "announcements",
@@ -1378,6 +1452,16 @@ function fmtPct(v) {
   return Number(v).toFixed(2) + '%';
 }
 
+// 财报报告期：日期 + 报告类型标签（一季报/中报/三季报/年报）
+function fmtReportPeriod(d) {
+  if (!d) return '<span class="text-gray-400">N/A</span>';
+  const mm = d.slice(5, 7);
+  const tagMap = { '03': '一季报', '06': '中报', '09': '三季报', '12': '年报' };
+  const tag = tagMap[mm] || '季报';
+  const cls = mm === '06' ? 'text-green-600' : 'text-gray-400';
+  return `<div class="text-gray-500">${d.slice(0, 10)}</div><div class="${cls}">${tag}</div>`;
+}
+
 function statusTag(status) {
   const map = {
     success: 'tag-success',
@@ -1712,6 +1796,11 @@ async function renderStockDetail(params) {
       <div id="kline-chart" style="height: 400px;"></div>
     </div>
 
+    <!-- 股东画像 -->
+    <div id="shareholder-card" class="card p-5 mb-6">
+      <div class="flex items-center gap-2"><span class="loading"></span> 加载股东画像...</div>
+    </div>
+
     <div class="grid grid-cols-2 gap-6">
       <!-- 财务指标 -->
       <div class="card p-5">
@@ -1759,6 +1848,68 @@ async function renderStockDetail(params) {
 
   // 加载K线图（等DOM渲染完）
   setTimeout(() => loadKline(code, 60), 50);
+  // 加载股东画像
+  loadShareholders(code);
+}
+
+async function loadShareholders(code) {
+  const el = document.getElementById('shareholder-card');
+  if (!el) return;
+  let data;
+  try {
+    data = await api(`/api/stock/${code}/shareholders`);
+  } catch (e) {
+    el.innerHTML = '<h3 class="font-bold mb-4">股东画像</h3><div class="text-gray-400 text-sm">加载失败</div>';
+    return;
+  }
+  if (!data || !data.has_data) {
+    el.innerHTML = '<h3 class="font-bold mb-4">股东画像</h3><div class="text-gray-400 text-sm">暂无股东数据</div>';
+    return;
+  }
+
+  const top10 = (data.top10 || []).map((h, i) => `
+    <tr class="border-b">
+      <td class="p-2 text-gray-500">${i + 1}</td>
+      <td class="p-2">${h.name || 'N/A'}</td>
+      <td class="p-2 text-right">${h.hold_shares !== null && h.hold_shares !== undefined ? fmtMoney(h.hold_shares) + ' 股' : 'N/A'}</td>
+      <td class="p-2 text-right">${h.hold_pct !== null && h.hold_pct !== undefined ? h.hold_pct.toFixed(2) + '%' : '—'}</td>
+    </tr>
+  `).join('');
+
+  el.innerHTML = `
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="font-bold">股东画像 ${data.report_date ? `<span class="text-sm text-gray-400 font-normal">(${data.report_date.slice(0,10)})</span>` : ''}</h3>
+      <span class="text-xs text-gray-400">更新于 ${data.updated_at ? data.updated_at.slice(0,10) : 'N/A'}</span>
+    </div>
+    <div class="grid grid-cols-3 gap-4 mb-4">
+      <div class="bg-gray-50 rounded p-3">
+        <div class="text-gray-500 text-sm">股东户数</div>
+        <div class="text-lg font-bold mt-1">${data.shareholder_count !== null && data.shareholder_count !== undefined ? data.shareholder_count.toLocaleString() : 'N/A'}</div>
+      </div>
+      <div class="bg-gray-50 rounded p-3">
+        <div class="text-gray-500 text-sm">机构持股估算</div>
+        <div class="text-lg font-bold mt-1">${data.inst_hold_pct !== null && data.inst_hold_pct !== undefined ? data.inst_hold_pct.toFixed(2) + '%' : 'N/A'}</div>
+      </div>
+      <div class="bg-gray-50 rounded p-3">
+        <div class="text-gray-500 text-sm">质押率</div>
+        <div class="text-lg font-bold mt-1 text-gray-300" title="${data.pledge_note || ''}">暂无数据</div>
+      </div>
+    </div>
+    <div class="text-xs text-amber-600 mb-3">⚠️ ${data.pledge_note || '质押率数据源未提供'}</div>
+    <table class="w-full text-sm">
+      <thead class="bg-gray-50 border-b">
+        <tr>
+          <th class="text-left p-2 text-gray-600">#</th>
+          <th class="text-left p-2 text-gray-600">股东名称</th>
+          <th class="text-right p-2 text-gray-600">持股数</th>
+          <th class="text-right p-2 text-gray-600">持股比例</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${top10 || '<tr><td colspan="4" class="p-3 text-center text-gray-400">无十大股东记录</td></tr>'}
+      </tbody>
+    </table>
+  `;
 }
 
 // ============================================================
@@ -2374,6 +2525,10 @@ async function renderScreener() {
             <input type="number" id="scr-max-turn" step="0.1" placeholder="最大" class="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
           </div>
         </div>
+        <div class="flex items-center gap-2 mt-3">
+          <input type="checkbox" id="scr-only-interim" class="w-4 h-4 text-blue-600 rounded">
+          <label for="scr-only-interim" class="text-sm text-gray-600">仅看已出中报（剔除仍为一季报的个股，避免横截面财务对比失真）</label>
+        </div>
       </div>
       <div class="flex justify-end gap-2 mt-4">
         <button onclick="resetScreener()" class="px-4 py-2 border rounded hover:bg-gray-50">重置</button>
@@ -2406,6 +2561,7 @@ function resetScreener() {
   ['min-cap', 'max-cap', 'min-pe', 'max-pe', 'min-pb', 'max-pb',
    'min-change', 'max-change', 'min-roe', 'max-roe', 'min-turn', 'max-turn'
   ].forEach(id => { const el = document.getElementById('scr-' + id); if (el) el.value = ''; });
+  const oi = document.getElementById('scr-only-interim'); if (oi) oi.checked = false;
   screenerPage = 1;
   document.getElementById('screener-results').innerHTML =
     '<div class="text-center text-gray-400 py-12">设置条件后点击"开始筛选"</div>';
@@ -2442,6 +2598,10 @@ async function runScreener(page = 1) {
     if (v !== null) params.set(key, v);
   });
 
+  // 仅看已出中报
+  const onlyInterim = document.getElementById('scr-only-interim');
+  if (onlyInterim && onlyInterim.checked) params.set('only_interim', '1');
+
   params.set('sort_by', screenerSortBy);
   params.set('sort_order', screenerSortOrder);
   params.set('page', page);
@@ -2476,6 +2636,7 @@ function renderScreenerResults(data) {
   };
 
   resultsDiv.innerHTML = `
+    ${data.finance_note ? `<div class="mb-3 mx-4 mt-4 px-3 py-2 bg-amber-50 text-amber-700 text-xs rounded leading-relaxed">⚠️ ${data.finance_note}</div>` : ''}
     <div class="p-4 border-b flex justify-between items-center">
       <div class="text-sm text-gray-500">共 <b>${data.total}</b> 只股票符合条件</div>
       <div class="text-xs text-gray-400">点击列标题可排序</div>
@@ -2493,6 +2654,7 @@ function renderScreenerResults(data) {
             ${sortCol('pb', 'PB')}
             ${sortCol('roe', 'ROE')}
             ${sortCol('turnover', '换手率')}
+            <th class="text-left p-3 text-sm text-gray-600">报告期</th>
           </tr>
         </thead>
         <tbody>
@@ -2515,6 +2677,9 @@ function renderScreenerResults(data) {
               <td class="text-right p-3">${s.pb ?? 'N/A'}</td>
               <td class="text-right p-3">${s.roe !== null && s.roe !== undefined ? s.roe.toFixed(2) + '%' : 'N/A'}</td>
               <td class="text-right p-3">${s.turnover_rate !== null && s.turnover_rate !== undefined ? s.turnover_rate.toFixed(2) + '%' : 'N/A'}</td>
+              <td class="p-3 text-xs">
+                ${fmtReportPeriod(s.report_date)}
+              </td>
             </tr>
           `).join('')}
         </tbody>

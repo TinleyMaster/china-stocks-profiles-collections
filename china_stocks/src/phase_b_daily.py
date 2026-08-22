@@ -286,12 +286,13 @@ def run_phase_daily(
     incremental: bool = True,
 ) -> None:
     """执行日线行情采集 phase。"""
+    # 先解析股票列表，避免全量调用时 stock_codes 为 None 导致下方 target 计算崩溃
+    if stock_codes is None:
+        stock_codes = get_stock_codes()
     target = ",".join(stock_codes[:5]) + ("..." if stock_codes and len(stock_codes) > 5 else "")
     run = start_run(platform_code="akshare", phase="phase_b_daily", target=target or "all")
     try:
         # 检查上游依赖：core.stock 是否有数据
-        if stock_codes is None:
-            stock_codes = get_stock_codes()
         if not stock_codes:
             finish_run(
                 run,
