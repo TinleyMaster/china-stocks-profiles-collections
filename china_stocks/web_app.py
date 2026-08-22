@@ -38,6 +38,14 @@ from .logging_setup import logger
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False  # 中文正常显示
 
+# 信任反向代理转发的协议头（Zeabur 边缘终止 TLS 后需要）
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+except ImportError:
+    pass
+
 
 # ============================================================
 # 全局响应钩子：安全头 + 隐藏 Server 版本
@@ -1382,13 +1390,21 @@ function docTypeLabel(type) {
   return map[type] || type;
 }
 
-// 将 UTC 时间字符串转为北京时间（Asia/Shanghai, UTC+8）
-// 输入格式: "2026-08-22 00:30:00" 或 ISO 格式
+// 将时间字符串转为北京时间（Asia/Shanghai, UTC+8）
+// 支持格式: "YYYY-MM-DD HH:MM:SS"（朴素UTC）、"YYYY-MM-DD HH:MM:SS+00:00"（带偏移）、ISO 格式
 function formatBJT(dateStr, withTime = true) {
   if (!dateStr) return '-';
-  // 兼容 "YYYY-MM-DD HH:MM:SS" 格式，替换为 ISO 可解析格式
-  const isoStr = dateStr.replace(' ', 'T') + 'Z'; // 标记为 UTC
-  const d = new Date(isoStr);
+  let d;
+  // 情况1：已带时区偏移（含 + 或 - 后缀，如 "+00:00"），JS 可直接解析
+  if (/[+-]\d{2}:\d{2}$/.test(dateStr) || dateStr.endsWith('Z')) {
+    // 空格替换为 T 以兼容 ISO 格式
+    const iso = dateStr.replace(' ', 'T');
+    d = new Date(iso);
+  } else {
+    // 情况2：朴素时间（无时区），视为 UTC，补 Z
+    const iso = dateStr.replace(' ', 'T') + 'Z';
+    d = new Date(iso);
+  }
   if (isNaN(d.getTime())) return dateStr;
   // 北京时间 = UTC + 8 小时
   const bjt = new Date(d.getTime() + 8 * 3600 * 1000);

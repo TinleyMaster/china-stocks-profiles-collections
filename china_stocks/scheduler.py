@@ -224,6 +224,13 @@ def start_scheduler() -> None:
 
     start_web_server(port=8080)
 
+    # 启动前回收所有存量僵尸任务（避免上次异常退出留下的 running 永久僵死）
+    from .sys import reap_all_stale_runs
+
+    reaped = reap_all_stale_runs()
+    if reaped > 0:
+        logger.warning(f"启动时回收了 {reaped} 个僵死的 running 任务")
+
     scheduler = build_scheduler()
     logger.info(
         f"调度器启动，时区 {TIMEZONE}，已注册 {len(scheduler.get_jobs())} 个任务:"
