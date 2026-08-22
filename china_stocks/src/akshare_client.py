@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable
 
 import pandas as pd
+import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from ..logging_setup import logger
@@ -69,6 +70,70 @@ def call_api(api_name: str, save_raw: bool = True, **kwargs) -> pd.DataFrame:
                 platform_code="akshare",
                 api_name=api_name,
                 params=kwargs,
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:
+            logger.warning(f"保存 raw 响应失败: {e}")
+
+    return df
+
+
+def fetch_tx_spot_snapshot(save_raw: bool = True) -> pd.DataFrame:
+    """腾讯证券-沪深京全市场实时快照（含 PE_TTM/PB/总市值/流通市值）。
+
+    自研分页实现，比 akshare.stock_zh_a_spot_tx 更稳定：
+    - Session 连接复用 + 浏览器 UA，避免被腾讯限流重置（SSL EOF）
+    - 页间间隔 0.3s，单页失败退避重试 3 次
+    返回列结构与 akshare 输出一致（保留 code/zxj/zdf/hsl/pe_ttm/pn/zsz/ltsz 等原始字段）。
+    """
+    url = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
+    page_size = 200
+    base_params = {
+        "_appver": "11.17.0",
+        "board_code": "aStock",
+        "sort_type": "price",
+        "direct": "down",
+        "count": str(page_size),
+    }
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+    })
+
+    def _get_page(offset: int) -> tuple[list[dict], int]:
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                r = sess.get(url, params={**base_params, "offset": str(offset)}, timeout=30)
+                r.raise_for_status()
+                data = r.json()["data"]
+                return data["rank_list"], int(data["total"])
+            except Exception as e:  # noqa: BLE001 - 网络异常统一退避重试
+                last_err = e
+                time.sleep(1 + attempt * 2)
+        raise ConnectionError(f"腾讯行情快照拉取失败 offset={offset}: {last_err}")
+
+    t0 = time.time()
+    rows: list[dict] = []
+    first, total = _get_page(0)
+    rows.extend(first)
+    for offset in range(page_size, total, page_size):
+        page_rows, _ = _get_page(offset)
+        rows.extend(page_rows)
+        time.sleep(0.3)
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["code"]).reset_index(drop=True)
+    logger.info(f"腾讯行情快照拉取完成: {len(df)} 行，耗时 {time.time() - t0:.1f}s")
+
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="akshare",
+                api_name="stock_zh_a_spot_tx",
+                params={"source": "tencent_direct", "total": total},
                 response=df.to_dict(orient="records"),
             )
         except Exception as e:

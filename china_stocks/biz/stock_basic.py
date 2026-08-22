@@ -12,13 +12,11 @@ from typing import Optional
 import pandas as pd
 from sqlalchemy import text
 
-from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def _get_latest_trade_date() -> Optional[date]:
@@ -66,111 +64,82 @@ def build_stock_basic_from_daily() -> int:
     return count
 
 
-def _fetch_valuation_one(code: str) -> Optional[dict]:
-    """从 akshare 获取单只股票的估值数据（PE/PB/市值等）。
+def _fetch_valuation_snapshot() -> pd.DataFrame:
+    """全市场一次拉取估值快照（腾讯源，含 PE_TTM/PB/市值）。
 
-    使用 stock_a_indicator_lg（乐咕乐股网的 A 股指标）或东财 F10 接口兜底。
+    替代原逐只调用的 stock_a_indicator_lg（该接口在新版 akshare 已移除）。
+    腾讯接口约 15 秒返回全部 5500+ 只，远快于逐只采集。
     """
-    try:
-        # 尝试东财 F10 主要指标
-        df = ak.call_api(
-            "stock_a_indicator_lg",
-            save_raw=False,
-            symbol=code,
-        )
-        if df.empty:
-            return None
-        # 取最新一行
-        latest = df.iloc[-1]
-        return {
-            "stock_code": code,
-            "pe_ttm": _safe_float(latest.get("pe_ttm")),
-            "pb": _safe_float(latest.get("pb")),
-            "ps_ttm": _safe_float(latest.get("ps_ttm")),
-            "dv_ttm": _safe_float(latest.get("dv_ttm")),
-            "total_market_cap": _safe_float(latest.get("total_mv")),  # 万元
-            "float_market_cap": _safe_float(latest.get("circ_mv")),
-        }
-    except Exception as e:
-        logger.debug(f"{code} 估值获取失败: {e}")
-        return None
+    df = ak.fetch_tx_spot_snapshot(save_raw=True)
+    if df.empty:
+        return pd.DataFrame()
 
+    out = pd.DataFrame()
+    # code 形如 sh688808 / sz000001，提取 6 位代码
+    out["stock_code"] = df["code"].astype(str).str[-6:]
+    out["pe_ttm"] = pd.to_numeric(df.get("pe_ttm"), errors="coerce")
+    out["pb"] = pd.to_numeric(df.get("pn"), errors="coerce")  # pn = 市净率
+    out["close"] = pd.to_numeric(df.get("zxj"), errors="coerce")
+    out["change_pct"] = pd.to_numeric(df.get("zdf"), errors="coerce")
+    out["turnover_rate"] = pd.to_numeric(df.get("hsl"), errors="coerce")
+    # 市值单位：腾讯返回亿元 → 元
+    out["total_market_cap"] = pd.to_numeric(df.get("zsz"), errors="coerce") * 1e8
+    out["float_market_cap"] = pd.to_numeric(df.get("ltsz"), errors="coerce") * 1e8
 
-def _safe_float(v) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        f = float(v)
-        return f if f == f else None  # NaN check
-    except (ValueError, TypeError):
-        return None
+    # 去重（以代码为准）
+    out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+    return out
 
 
 def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) -> int:
     """
-    批量采集估值数据并写入 biz.stock_basic。
-    全量 5000+ 只约 5~10 分钟（4 并发）。
+    采集估值数据并写入 biz.stock_basic。
+
+    全市场一次拉取（腾讯快照），批量 upsert，秒级完成。
+    codes/limit 参数保留用于兼容，实际按全市场快照写入后过滤。
     """
-    if codes is None:
-        codes = get_stock_codes()
+    val_df = _fetch_valuation_snapshot()
+    if val_df.empty:
+        logger.warning("估值快照拉取为空")
+        return 0
+
+    # 如指定了 codes，只保留目标股票
+    if codes:
+        val_df = val_df[val_df["stock_code"].isin(set(codes))]
     if limit and limit > 0:
-        codes = codes[:limit]
+        val_df = val_df.head(limit)
 
-    results: list[dict] = []
-
-    def _task(code: str) -> Optional[dict]:
-        return _fetch_valuation_one(code)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_task, code): code for code in codes}
-        for i, fut in enumerate(as_completed(futures), 1):
-            res = fut.result()
-            if res:
-                results.append(res)
-            if i % 200 == 0:
-                logger.info(f"估值采集进度: {i}/{len(codes)}, 成功 {len(results)}")
-
-    if not results:
-        logger.warning("估值数据全部获取失败")
+    if val_df.empty:
         return 0
 
     with get_session() as sess:
-        for r in results:
-            total_mv = r.get("total_market_cap")
-            # 单位转换：乐咕接口 total_mv 是万元 → 元
-            if total_mv is not None:
-                total_mv = total_mv * 10000
-            float_mv = r.get("float_market_cap")
-            if float_mv is not None:
-                float_mv = float_mv * 10000
+        conn = sess.connection()
+        # 临时表 + 批量 upsert
+        val_df.to_sql(
+            "tmp_valuation",
+            conn,
+            schema="biz",
+            if_exists="replace",
+            index=False,
+            method="multi",
+            chunksize=2000,
+        )
+        sess.execute(text("""
+            INSERT INTO biz.stock_basic
+                (stock_code, pe_ttm, pb, total_market_cap, float_market_cap, updated_at)
+            SELECT stock_code, pe_ttm, pb, total_market_cap, float_market_cap, NOW()
+            FROM biz.tmp_valuation
+            ON CONFLICT (stock_code) DO UPDATE SET
+                pe_ttm = EXCLUDED.pe_ttm,
+                pb = EXCLUDED.pb,
+                total_market_cap = EXCLUDED.total_market_cap,
+                float_market_cap = EXCLUDED.float_market_cap,
+                updated_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_valuation"))
 
-            sess.execute(text("""
-                INSERT INTO biz.stock_basic
-                    (stock_code, pe_ttm, pb, ps_ttm, dv_ttm,
-                     total_market_cap, float_market_cap, updated_at)
-                VALUES
-                    (:code, :pe_ttm, :pb, :ps_ttm, :dv_ttm,
-                     :total_mv, :float_mv, NOW())
-                ON CONFLICT (stock_code) DO UPDATE SET
-                    pe_ttm = EXCLUDED.pe_ttm,
-                    pb = EXCLUDED.pb,
-                    ps_ttm = EXCLUDED.ps_ttm,
-                    dv_ttm = EXCLUDED.dv_ttm,
-                    total_market_cap = EXCLUDED.total_market_cap,
-                    float_market_cap = EXCLUDED.float_market_cap,
-                    updated_at = NOW()
-            """), {
-                "code": r["stock_code"],
-                "pe_ttm": r.get("pe_ttm"),
-                "pb": r.get("pb"),
-                "ps_ttm": r.get("ps_ttm"),
-                "dv_ttm": r.get("dv_ttm"),
-                "total_mv": total_mv,
-                "float_mv": float_mv,
-            })
-
-    logger.info(f"估值数据写入完成，共 {len(results)} 只")
-    return len(results)
+    logger.info(f"估值数据写入完成，共 {len(val_df)} 只")
+    return len(val_df)
 
 
 def run_stock_basic() -> None:
