@@ -8,6 +8,7 @@ biz 层：财务指标画像 biz.finance_snapshot
 """
 from __future__ import annotations
 
+import time
 from datetime import date as dt_date
 from typing import Optional
 
@@ -24,9 +25,7 @@ from ..src.phase_a_stock_pool import get_stock_codes
 def _fetch_finance_one(code: str) -> Optional[dict]:
     """获取单只股票的最新财务指标（最近约两年报告期，取最新一期）。"""
     try:
-        df = ak.call_api(
-            "stock_financial_analysis_indicator",
-            save_raw=False,
+        df = ak.fetch_finance_indicator(
             symbol=code,
             start_year=str(dt_date.today().year - 2),
         )
@@ -90,6 +89,8 @@ def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) ->
             results.append(res)
         if i % 200 == 0:
             logger.info(f"财务指标进度: {i}/{len(codes)}, 成功 {len(results)}")
+        # 节流：共享 Session 虽复用连接，但新浪仍会按请求频率限流，逐只间隔 0.25s
+        time.sleep(0.25)
 
     if not results:
         logger.warning("财务指标全部获取失败")
