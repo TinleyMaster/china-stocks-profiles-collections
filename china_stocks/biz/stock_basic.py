@@ -124,16 +124,30 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
             method="multi",
             chunksize=2000,
         )
+        # 行情字段（close/change_pct/turnover_rate）已在腾讯快照中取到；
+        # stock_name 来自 core.stock，as_of_date 取采集当日，解除对空 stock_daily 的依赖。
         sess.execute(text("""
             INSERT INTO biz.stock_basic
-                (stock_code, pe_ttm, pb, total_market_cap, float_market_cap, updated_at)
-            SELECT stock_code, pe_ttm, pb, total_market_cap, float_market_cap, NOW()
-            FROM biz.tmp_valuation
+                (stock_code, stock_name, pe_ttm, pb, close, change_pct,
+                 turnover_rate, total_market_cap, float_market_cap, as_of_date, updated_at)
+            SELECT
+                t.stock_code,
+                s.stock_name,
+                t.pe_ttm, t.pb, t.close, t.change_pct, t.turnover_rate,
+                t.total_market_cap, t.float_market_cap,
+                CURRENT_DATE, NOW()
+            FROM biz.tmp_valuation t
+            LEFT JOIN core.stock s ON s.stock_code = t.stock_code
             ON CONFLICT (stock_code) DO UPDATE SET
+                stock_name = EXCLUDED.stock_name,
                 pe_ttm = EXCLUDED.pe_ttm,
                 pb = EXCLUDED.pb,
+                close = EXCLUDED.close,
+                change_pct = EXCLUDED.change_pct,
+                turnover_rate = EXCLUDED.turnover_rate,
                 total_market_cap = EXCLUDED.total_market_cap,
                 float_market_cap = EXCLUDED.float_market_cap,
+                as_of_date = EXCLUDED.as_of_date,
                 updated_at = NOW()
         """))
         sess.execute(text("DROP TABLE IF EXISTS biz.tmp_valuation"))

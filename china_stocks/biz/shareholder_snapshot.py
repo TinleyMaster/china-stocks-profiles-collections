@@ -103,28 +103,54 @@ def _fetch_profile(code: str) -> Optional[dict]:
 def fetch_and_save_shareholders(
     codes: Optional[list[str]] = None,
     limit: int = 0,
+    flush_every: int = 500,
 ) -> tuple[int, int]:
-    """批量采集股东画像。串行拉取（新浪源），临时表批量写入。"""
+    """批量采集股东画像。串行拉取（新浪源），增量落盘。
+
+    flush_every：每累积这么多只就先 upsert 一次，避免一次性写入失败导致整批丢失。
+    """
     if codes is None:
         codes = get_stock_codes()
     if limit and limit > 0:
         codes = codes[:limit]
 
     results: list[dict] = []
-    logger.info(f"开始采集股东画像: {len(codes)} 只")
+    total_saved = 0
+    total_failed = 0
+    logger.info(f"开始采集股东画像: {len(codes)} 只（每 {flush_every} 只增量落盘）")
 
     for i, code in enumerate(codes, 1):
         profile = _fetch_profile(code)
         if profile:
             results.append(profile)
-        if i % 200 == 0:
-            logger.info(f"股东画像进度: {i}/{len(codes)}, 成功 {len(results)}")
+        else:
+            total_failed += 1
         # 节流：共享 Session 虽复用连接，但新浪仍按请求频率限流，逐只间隔 0.25s
         time.sleep(0.25)
 
+        if len(results) >= flush_every:
+            saved = _flush_shareholders(results)
+            total_saved += saved
+            results = []
+            logger.info(f"股东画像进度: {i}/{len(codes)}, 累计落盘 {total_saved}")
+
+    # 末尾剩余批次
+    if results:
+        saved = _flush_shareholders(results)
+        total_saved += saved
+        logger.info(f"股东画像进度: {len(codes)}/{len(codes)}, 累计落盘 {total_saved}")
+
+    if total_saved == 0:
+        logger.warning("股东画像全部获取失败，未写入任何数据")
+    else:
+        logger.info(f"股东画像写入完成，共 {total_saved} 只")
+    return total_saved, total_failed
+
+
+def _flush_shareholders(results: list[dict]) -> int:
+    """把一批股东画像写入 biz.shareholder_snapshot（临时表 + 幂等 upsert）。返回写入条数。"""
     if not results:
-        logger.warning("股东画像全部获取失败")
-        return 0, len(codes)
+        return 0
 
     rows = []
     for p in results:
@@ -168,8 +194,7 @@ def fetch_and_save_shareholders(
         """))
         sess.execute(text("DROP TABLE IF EXISTS biz.tmp_shareholder"))
 
-    logger.info(f"股东画像写入完成，共 {len(df)} 只")
-    return len(df), 0
+    return len(df)
 
 
 def run_shareholder_snapshot() -> None:

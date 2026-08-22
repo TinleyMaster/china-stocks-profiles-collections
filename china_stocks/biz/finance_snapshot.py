@@ -73,30 +73,10 @@ def _fetch_finance_one(code: str) -> Optional[dict]:
         return None
 
 
-def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) -> int:
-    """批量采集财务指标。串行拉取（新浪源，约 0.5s/只），批量写入。"""
-    if codes is None:
-        codes = get_stock_codes()
-    if limit and limit > 0:
-        codes = codes[:limit]
-
-    results: list[dict] = []
-    logger.info(f"开始采集财务指标: {len(codes)} 只股票")
-
-    for i, code in enumerate(codes, 1):
-        res = _fetch_finance_one(code)
-        if res:
-            results.append(res)
-        if i % 200 == 0:
-            logger.info(f"财务指标进度: {i}/{len(codes)}, 成功 {len(results)}")
-        # 节流：共享 Session 虽复用连接，但新浪仍会按请求频率限流，逐只间隔 0.25s
-        time.sleep(0.25)
-
+def _flush_finance(results: list[dict]) -> int:
+    """把一批财务指标写入 biz.finance_snapshot（临时表 + upsert）。返回写入条数。"""
     if not results:
-        logger.warning("财务指标全部获取失败")
         return 0
-
-    # 批量写入：临时表 + 一次性 upsert，替代逐条 INSERT
     df = pd.DataFrame(results)
     # report_date 统一为 YYYY-MM-DD 字符串，避免类型歧义
     df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.date
@@ -135,9 +115,50 @@ def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) ->
                 updated_at = NOW()
         """))
         sess.execute(text("DROP TABLE IF EXISTS biz.tmp_finance_snapshot"))
-
-    logger.info(f"财务指标写入完成，共 {len(results)} 只")
     return len(results)
+
+
+def fetch_and_save_finance(
+    codes: Optional[list[str]] = None, limit: int = 0, flush_every: int = 500
+) -> int:
+    """批量采集财务指标。串行拉取（新浪源，约 0.5s/只），增量落盘。
+
+    flush_every：每累积这么多只就先 upsert 一次，避免一次性写入失败导致整批丢失
+    （⚠️ 旧实现攒完全部再写，曾因单值 numeric 溢出令 5549 行全部丢失）。
+    """
+    if codes is None:
+        codes = get_stock_codes()
+    if limit and limit > 0:
+        codes = codes[:limit]
+
+    results: list[dict] = []
+    total_saved = 0
+    logger.info(f"开始采集财务指标: {len(codes)} 只股票（每 {flush_every} 只增量落盘）")
+
+    for i, code in enumerate(codes, 1):
+        res = _fetch_finance_one(code)
+        if res:
+            results.append(res)
+        # 节流：共享 Session 虽复用连接，但新浪仍会按请求频率限流，逐只间隔 0.25s
+        time.sleep(0.25)
+
+        if len(results) >= flush_every:
+            saved = _flush_finance(results)
+            total_saved += saved
+            results = []
+            logger.info(f"财务指标进度: {i}/{len(codes)}, 累计落盘 {total_saved}")
+
+    # 末尾剩余批次
+    if results:
+        saved = _flush_finance(results)
+        total_saved += saved
+        logger.info(f"财务指标进度: {len(codes)}/{len(codes)}, 累计落盘 {total_saved}")
+
+    if total_saved == 0:
+        logger.warning("财务指标全部获取失败，未写入任何数据")
+    else:
+        logger.info(f"财务指标写入完成，共 {total_saved} 只")
+    return total_saved
 
 
 def run_finance_snapshot() -> None:

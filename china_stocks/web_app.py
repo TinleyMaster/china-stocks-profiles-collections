@@ -164,15 +164,22 @@ def api_stats():
 
 @app.route("/api/industries")
 def api_industries():
-    """获取申万行业列表（一级 + 二级树状结构）。"""
+    """获取申万行业列表（一级 + 二级树状结构）。
+
+    注：core.stock.primary_industry_l2 普遍为空（仅填了一级行业），
+    故用 COALESCE(l2, l1) 兜底，让一级行业自身作为唯一子节点，
+    保证前端行业下拉框有数据可选、筛选也能命中。
+    """
     with get_session() as sess:
         rows = sess.execute(
             text("""
-            SELECT primary_industry_l1 AS industry_l1, primary_industry_l2 AS industry_l2, COUNT(*) as stock_count
+            SELECT primary_industry_l1 AS industry_l1,
+                   COALESCE(primary_industry_l2, primary_industry_l1) AS industry_l2,
+                   COUNT(*) as stock_count
             FROM core.stock
-            WHERE primary_industry_l1 IS NOT NULL AND primary_industry_l2 IS NOT NULL
-            GROUP BY primary_industry_l1, primary_industry_l2
-            ORDER BY primary_industry_l1, primary_industry_l2
+            WHERE primary_industry_l1 IS NOT NULL
+            GROUP BY primary_industry_l1, COALESCE(primary_industry_l2, primary_industry_l1)
+            ORDER BY primary_industry_l1, industry_l2
         """)
         ).fetchall()
 
@@ -303,7 +310,8 @@ def api_screener():
         conditions.append("s.primary_industry_l1 = :ind1")
         params["ind1"] = industry_l1
     if industry_l2:
-        conditions.append("s.primary_industry_l2 = :ind2")
+        # 二级行业普遍为空，用 COALESCE(l2, l1) 兜底，使仅有一级的行业也能被筛选命中
+        conditions.append("COALESCE(s.primary_industry_l2, s.primary_industry_l1) = :ind2")
         params["ind2"] = industry_l2
     if min_cap is not None:
         conditions.append("b.total_market_cap >= :min_cap * 1e8")
