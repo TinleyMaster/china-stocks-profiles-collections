@@ -60,9 +60,10 @@ def _secure_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    # HSTS（HTTPS 环境下生效）
-    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # HSTS：站点仅经 Zeabur 以 HTTPS 暴露，无条件启用
+    # 浏览器只在 HTTPS 响应上采纳 HSTS，HTTP 响应收到也无副作用
+    # 不依赖 request.is_secure（Werkzeug 3.x 默认不信任代理，is_secure 恒 False）
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
