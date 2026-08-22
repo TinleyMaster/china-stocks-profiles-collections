@@ -36,20 +36,51 @@ def _get_last_trade_date(stock_code: str) -> Optional[date]:
 
 
 def _fetch_one_stock(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """拉取单只股票日 K 线。"""
-    df = ak.call_api(
-        "stock_zh_a_hist",
-        save_raw=False,  # 单只股票不存 raw，避免表爆炸；整体在外部批量汇总再存
-        symbol=stock_code,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq",  # 前复权
-    )
+    """拉取单只股票日 K 线。
 
-    if df.empty:
-        return df
+    优先用东方财富 stock_zh_a_hist（字段全），失败则用新浪 stock_zh_a_daily 兜底。
+    """
+    # 尝试东方财富
+    try:
+        df = ak.call_api(
+            "stock_zh_a_hist",
+            save_raw=False,  # 单只股票不存 raw，避免表爆炸；整体在外部批量汇总再存
+            symbol=stock_code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",  # 前复权
+        )
+        if not df.empty:
+            return _normalize_em_daily(df, stock_code)
+    except Exception as e:
+        logger.debug(f"{stock_code} 东方财富日线失败: {e}，尝试新浪兜底")
 
+    # 新浪兜底：stock_zh_a_daily（symbol 需带市场前缀，如 sz000001 / sh600000）
+    from .phase_a_stock_pool import _detect_market
+
+    market = _detect_market(stock_code)
+    if market in ("SH", "SZ"):
+        symbol = f"{market.lower()}{stock_code}"
+        try:
+            df = ak.call_api(
+                "stock_zh_a_daily",
+                save_raw=False,
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            if not df.empty:
+                return _normalize_sina_daily(df, stock_code)
+        except Exception as e:
+            logger.warning(f"{stock_code} 新浪日线也失败: {e}")
+
+    return pd.DataFrame()
+
+
+def _normalize_em_daily(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+    """标准化东方财富日线数据。"""
     # 列名映射（akshare 返回中文）
     col_map = {
         "日期": "trade_date",
@@ -93,39 +124,82 @@ def _fetch_one_stock(stock_code: str, start_date: str, end_date: str) -> pd.Data
                "change_amount", "turnover_rate"]]
 
 
+def _normalize_sina_daily(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+    """标准化新浪日线数据（字段少，衍生指标需计算）。"""
+    out = pd.DataFrame()
+    out["trade_date"] = pd.to_datetime(df["date"]).dt.date
+    out["stock_code"] = stock_code
+    out["open"] = pd.to_numeric(df.get("open"), errors="coerce")
+    out["high"] = pd.to_numeric(df.get("high"), errors="coerce")
+    out["low"] = pd.to_numeric(df.get("low"), errors="coerce")
+    out["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+    out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce").astype("Int64")
+    out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+
+    # 衍生指标（新浪接口不直接提供）
+    # 涨跌幅 = (今收 - 昨收) / 昨收 * 100
+    prev_close = out["close"].shift(1)
+    out["change_pct"] = ((out["close"] - prev_close) / prev_close * 100).round(3)
+    out["change_amount"] = (out["close"] - prev_close).round(3)
+    # 振幅 = (最高 - 最低) / 昨收 * 100
+    out["amplitude"] = ((out["high"] - out["low"]) / prev_close * 100).round(3)
+    # 换手率 = 成交量 / 流通股本 * 100（新浪有 outstanding_share 但单位可能不一致，暂留空）
+    if "outstanding_share" in df.columns:
+        out_share = pd.to_numeric(df["outstanding_share"], errors="coerce")
+        out["turnover_rate"] = (out["volume"] / out_share * 100).round(3)
+    else:
+        out["turnover_rate"] = None
+
+    return out[["stock_code", "trade_date", "open", "high", "low", "close",
+               "volume", "amount", "amplitude", "change_pct",
+               "change_amount", "turnover_rate"]]
+
+
 def _save_daily_batch(df: pd.DataFrame) -> int:
-    """批量写入日线行情，冲突更新（其实应该是新增为主）。"""
+    """批量写入日线行情（临时表 + UPSERT，性能远优于逐条 executemany）。"""
     if df.empty:
         return 0
 
-    rows = df.to_dict(orient="records")
     with get_session() as sess:
-        sess.execute(
-            text("""
-                INSERT INTO src_akshare.stock_daily
-                    (stock_code, trade_date, open, high, low, close,
-                     volume, amount, amplitude, change_pct,
-                     change_amount, turnover_rate, fetched_at)
-                VALUES
-                    (:stock_code, :trade_date, :open, :high, :low, :close,
-                     :volume, :amount, :amplitude, :change_pct,
-                     :change_amount, :turnover_rate, NOW())
-                ON CONFLICT (stock_code, trade_date) DO UPDATE SET
-                    open = EXCLUDED.open,
-                    high = EXCLUDED.high,
-                    low = EXCLUDED.low,
-                    close = EXCLUDED.close,
-                    volume = EXCLUDED.volume,
-                    amount = EXCLUDED.amount,
-                    amplitude = EXCLUDED.amplitude,
-                    change_pct = EXCLUDED.change_pct,
-                    change_amount = EXCLUDED.change_amount,
-                    turnover_rate = EXCLUDED.turnover_rate,
-                    fetched_at = NOW()
-            """),
-            rows,
+        conn = sess.connection()
+        # 1. 写入临时表（pandas to_sql + multi 批量）
+        df.to_sql(
+            "tmp_daily_batch",
+            conn,
+            schema="src_akshare",
+            if_exists="replace",
+            index=False,
+            method="multi",
+            chunksize=2000,
         )
-    return len(rows)
+        # 2. 从临时表 UPSERT 到正式表
+        result = sess.execute(text("""
+            INSERT INTO src_akshare.stock_daily
+                (stock_code, trade_date, open, high, low, close,
+                 volume, amount, amplitude, change_pct,
+                 change_amount, turnover_rate, fetched_at)
+            SELECT
+                stock_code, trade_date, open, high, low, close,
+                volume, amount, amplitude, change_pct,
+                change_amount, turnover_rate, NOW()
+            FROM src_akshare.tmp_daily_batch
+            ON CONFLICT (stock_code, trade_date) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                amount = EXCLUDED.amount,
+                amplitude = EXCLUDED.amplitude,
+                change_pct = EXCLUDED.change_pct,
+                change_amount = EXCLUDED.change_amount,
+                turnover_rate = EXCLUDED.turnover_rate,
+                fetched_at = NOW()
+        """))
+        # 3. 清理临时表
+        sess.execute(text("DROP TABLE IF EXISTS src_akshare.tmp_daily_batch"))
+
+    return len(df)
 
 
 def fetch_daily(
