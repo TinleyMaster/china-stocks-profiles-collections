@@ -232,7 +232,7 @@ def build_notebook_for_stock(stock_code: str) -> dict:
                     stock_name = :name,
                     industry_l1 = :l1,
                     industry_l2 = :l2,
-                    completeness_json = :cjson::jsonb,
+                    completeness_json = CAST(:cjson AS jsonb),
                     total_docs = :td,
                     downloaded_docs = :dd,
                     total_events = :te,
@@ -257,7 +257,7 @@ def build_notebook_for_stock(stock_code: str) -> dict:
                      completeness_json, total_docs, downloaded_docs,
                      total_events, latest_report_date)
                 VALUES
-                    (:code, :name, :l1, :l2, :cjson::jsonb, :td, :dd, :te, :lr)
+                    (:code, :name, :l1, :l2, CAST(:cjson AS jsonb), :td, :dd, :te, :lr)
             """), {
                 "code": stock_code,
                 "name": stock.stock_name,

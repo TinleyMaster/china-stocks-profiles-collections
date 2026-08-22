@@ -550,7 +550,7 @@ def ask_stock(
                 text("""
                 INSERT INTO biz.research_message
                     (stock_code, role, content, sources, model, tokens_used)
-                VALUES (:code, 'assistant', :content, :sources::jsonb, :model, :tokens)
+                VALUES (:code, 'assistant', :content, CAST(:sources AS jsonb), :model, :tokens)
             """),
                 {
                     "code": stock_code,

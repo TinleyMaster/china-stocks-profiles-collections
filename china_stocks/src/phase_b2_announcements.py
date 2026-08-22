@@ -145,7 +145,7 @@ def _parse_and_save(df: pd.DataFrame) -> tuple[int, int]:
                         title = :title,
                         doc_type = :doc_type,
                         sub_type = :sub_type,
-                        content_topics = :topics::text[],
+                        content_topics = CAST(:topics AS text[]),
                         classify_method = :method,
                         classify_confidence = :conf
                     WHERE id = :id
@@ -167,7 +167,7 @@ def _parse_and_save(df: pd.DataFrame) -> tuple[int, int]:
                          classify_confidence)
                     VALUES
                         (:code, 'cninfo', :doc_type, :sub_type, :title,
-                         :pub_date, :url, :topics::text[], :method, :conf)
+                         :pub_date, :url, CAST(:topics AS text[]), :method, :conf)
                 """), {
                     "code": code,
                     "doc_type": cls.doc_type,

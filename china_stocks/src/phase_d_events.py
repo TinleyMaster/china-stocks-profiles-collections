@@ -306,7 +306,7 @@ def _save_events(code: str, events: list[dict]) -> int:
                 # 更新数据（如果内容有变化）
                 sess.execute(text("""
                     UPDATE biz.corporate_event SET
-                        event_data = :data::jsonb,
+                        event_data = CAST(:data AS jsonb),
                         fetched_at = NOW()
                     WHERE id = :id
                 """), {"id": existing[0], "data": data_json})
@@ -315,7 +315,7 @@ def _save_events(code: str, events: list[dict]) -> int:
                     INSERT INTO biz.corporate_event
                         (stock_code, event_type, event_date, event_data)
                     VALUES
-                        (:code, :etype, :edate, :data::jsonb)
+                        (:code, :etype, :edate, CAST(:data AS jsonb))
                 """), {
                     "code": code,
                     "etype": ev["event_type"],

@@ -83,23 +83,19 @@ def save_stock_list_to_src(df: pd.DataFrame) -> int:
     """写入 src_akshare.stock_list（先清空再写入快照）。"""
     with get_session() as sess:
         sess.execute(text("TRUNCATE TABLE src_akshare.stock_list"))
-        rows = [
-            {
-                "code": r.stock_code,
-                "name": r.stock_name,
-                "market": r.market,
-            }
-            for r in df.itertuples(index=False)
-        ]
-        sess.execute(
-            text("""
-                INSERT INTO src_akshare.stock_list (stock_code, stock_name, market)
-                VALUES (:code, :name, :market)
-            """),
-            rows,
+        # 用 pandas to_sql + multi 批量插入，比 executemany 快 10-100 倍
+        # （远程数据库网络延迟下尤其明显）
+        df[["stock_code", "stock_name", "market"]].to_sql(
+            "stock_list",
+            sess.connection(),
+            schema="src_akshare",
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
         )
-    logger.info(f"src_akshare.stock_list 写入 {len(rows)} 行")
-    return len(rows)
+    logger.info(f"src_akshare.stock_list 写入 {len(df)} 行")
+    return len(df)
 
 
 def fetch_sw_industry() -> pd.DataFrame:
@@ -171,81 +167,41 @@ def refresh_core_stock() -> tuple[int, int]:
     返回 (inserted, updated)。
     """
     with get_session() as sess:
-        # 1. 合并 stock_list + sw_industry
-        rows = sess.execute(text("""
+        # 单条 SQL 批量 UPSERT，避免逐行循环的 N 次远程往返
+        # is_st / full_code / 行业字段都在 SQL 内计算
+        result = sess.execute(text("""
+            INSERT INTO core.stock (
+                stock_code, stock_name, market, full_code,
+                primary_industry_l1, primary_industry_l2, primary_industry_l3,
+                is_st, is_delisted
+            )
             SELECT
                 sl.stock_code,
                 sl.stock_name,
                 sl.market,
+                sl.market || '.' || sl.stock_code AS full_code,
                 sw.industry_l1,
                 sw.industry_l2,
-                sw.industry_l3
+                sw.industry_l3,
+                (sl.stock_name LIKE '%ST%') AS is_st,
+                FALSE
             FROM src_akshare.stock_list sl
             LEFT JOIN src_akshare.sw_industry sw
                 ON sl.stock_code = sw.stock_code
-        """)).fetchall()
-
-        inserted = 0
-        updated = 0
-        for row in rows:
-            code = row.stock_code
-            # 判断是否 ST
-            is_st = "ST" in row.stock_name or "*ST" in row.stock_name
-            full_code = f"{row.market}{code}"
-
-            existing = sess.execute(
-                text("SELECT 1 FROM core.stock WHERE stock_code = :c"),
-                {"c": code},
-            ).fetchone()
-
-            if existing:
-                sess.execute(
-                    text("""
-                        UPDATE core.stock SET
-                            stock_name = :name,
-                            market = :market,
-                            full_code = :full,
-                            primary_industry_l1 = COALESCE(:l1, primary_industry_l1),
-                            primary_industry_l2 = COALESCE(:l2, primary_industry_l2),
-                            primary_industry_l3 = COALESCE(:l3, primary_industry_l3),
-                            is_st = :is_st,
-                            updated_at = NOW()
-                        WHERE stock_code = :code
-                    """),
-                    {
-                        "code": code,
-                        "name": row.stock_name,
-                        "market": row.market,
-                        "full": full_code,
-                        "l1": row.industry_l1,
-                        "l2": row.industry_l2,
-                        "l3": row.industry_l3,
-                        "is_st": is_st,
-                    },
-                )
-                updated += 1
-            else:
-                sess.execute(
-                    text("""
-                        INSERT INTO core.stock
-                            (stock_code, stock_name, market, full_code,
-                             primary_industry_l1, primary_industry_l2, primary_industry_l3,
-                             is_st, is_delisted)
-                        VALUES
-                            (:code, :name, :market, :full, :l1, :l2, :l3, :is_st, FALSE)
-                    """),
-                    {
-                        "code": code,
-                        "name": row.stock_name,
-                        "market": row.market,
-                        "full": full_code,
-                        "l1": row.industry_l1,
-                        "l2": row.industry_l2,
-                        "l3": row.industry_l3,
-                        "is_st": is_st,
-                    },
-                )
-                inserted += 1
+            ON CONFLICT (stock_code) DO UPDATE SET
+                stock_name = EXCLUDED.stock_name,
+                market = EXCLUDED.market,
+                full_code = EXCLUDED.full_code,
+                primary_industry_l1 = COALESCE(EXCLUDED.primary_industry_l1, core.stock.primary_industry_l1),
+                primary_industry_l2 = COALESCE(EXCLUDED.primary_industry_l2, core.stock.primary_industry_l2),
+                primary_industry_l3 = COALESCE(EXCLUDED.primary_industry_l3, core.stock.primary_industry_l3),
+                is_st = EXCLUDED.is_st,
+                updated_at = NOW()
+            RETURNING (xmax = 0) AS is_new
+        """))
+        rows = result.fetchall()
+        inserted = sum(1 for r in rows if r.is_new)
+        updated = len(rows) - inserted
 
         # 2. 同步 core.stock_source_map（akshare 平台）
         sess.execute(

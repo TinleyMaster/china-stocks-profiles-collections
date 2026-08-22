@@ -128,7 +128,7 @@ def _enrich_survey_entries(df: pd.DataFrame) -> int:
                          publish_date, content_topics, classify_method, classify_confidence)
                     VALUES
                         (:code, 'eastmoney', 'survey', :st, :title,
-                         :sd, ARRAY['survey']::text[], 'rule', 0.9)
+                         :sd, CAST(ARRAY['survey'] AS text[]), 'rule', 0.9)
                 """), {
                     "code": code,
                     "st": f"调研:{survey_type}" if survey_type else "调研",

@@ -232,7 +232,7 @@ def _save_one_shareholder(code: str, top10: Optional[dict], pledge_pct: Optional
         if existing:
             sess.execute(text("""
                 UPDATE biz.shareholder_snapshot SET
-                    top10_json = :json::jsonb,
+                    top10_json = CAST(:json AS jsonb),
                     inst_hold_pct = COALESCE(:inst, inst_hold_pct),
                     pledge_pct = COALESCE(:pledge, pledge_pct),
                     updated_at = NOW()
@@ -248,7 +248,7 @@ def _save_one_shareholder(code: str, top10: Optional[dict], pledge_pct: Optional
                 INSERT INTO biz.shareholder_snapshot
                     (stock_code, report_date, top10_json, inst_hold_pct, pledge_pct)
                 VALUES
-                    (:code, :rd, :json::jsonb, :inst, :pledge)
+                    (:code, :rd, CAST(:json AS jsonb), :inst, :pledge)
             """), {
                 "code": code,
                 "rd": report_date,

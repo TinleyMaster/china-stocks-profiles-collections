@@ -22,10 +22,12 @@ def save_raw_response(
         resp_json = {"raw": str(response)}
 
     with get_session() as sess:
+        # 注意：SQLAlchemy text() 中 :: 与 :name 参数语法冲突，
+        # 用 CAST(... AS jsonb) 替代 ::jsonb 写法
         row = sess.execute(
             text("""
                 INSERT INTO raw.api_response (platform_code, api_name, params, response)
-                VALUES (:pc, :api, :params::jsonb, :resp::jsonb)
+                VALUES (:pc, :api, CAST(:params AS jsonb), CAST(:resp AS jsonb))
                 RETURNING id
             """),
             {

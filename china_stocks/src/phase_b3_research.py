@@ -134,7 +134,7 @@ def _parse_and_save(df: pd.DataFrame) -> tuple[int, int]:
                 sess.execute(text("""
                     UPDATE biz.doc_source_entry SET
                         title = :title,
-                        content_topics = :topics::text[],
+                        content_topics = CAST(:topics AS text[]),
                         classify_method = :method,
                         classify_confidence = :conf
                     WHERE id = :id
@@ -161,7 +161,7 @@ def _parse_and_save(df: pd.DataFrame) -> tuple[int, int]:
                          classify_confidence)
                     VALUES
                         (:code, 'eastmoney_research', 'research', :broker, :title,
-                         :pub_date, :url, :topics::text[], :method, :conf)
+                         :pub_date, :url, CAST(:topics AS text[]), :method, :conf)
                 """), {
                     "code": stock_code,
                     "broker": broker or None,
