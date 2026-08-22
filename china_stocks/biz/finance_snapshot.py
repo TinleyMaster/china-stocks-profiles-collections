@@ -4,17 +4,16 @@ biz 层：财务指标画像 biz.finance_snapshot
 从 akshare 拉取关键财务指标（ROE/毛利率/净利率/营收增速等），
 结构化写入 biz.finance_snapshot，供投研快速查询。
 
-数据来源：stock_financial_analysis_indicator（东方财富财务分析指标）
+数据来源：stock_financial_analysis_indicator（新浪财务分析指标）
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date as dt_date
 from typing import Optional
 
 import pandas as pd
 from sqlalchemy import text
 
-from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
@@ -23,46 +22,52 @@ from ..src.phase_a_stock_pool import get_stock_codes
 
 
 def _fetch_finance_one(code: str) -> Optional[dict]:
-    """获取单只股票的最新财务指标。"""
+    """获取单只股票的最新财务指标（最近约两年报告期，取最新一期）。"""
     try:
         df = ak.call_api(
             "stock_financial_analysis_indicator",
             save_raw=False,
             symbol=code,
+            start_year=str(dt_date.today().year - 2),
         )
-        if df.empty:
+        if df.empty or "日期" not in df.columns:
             return None
 
-        # akshare 返回的列名是中文，版本差异大，用模糊匹配
-        latest = df.iloc[0]  # 第一行是最新报告期
-        cols = {c: c for c in df.columns}
+        # 返回行按报告期升序，最后一行才是最新报告期
+        latest = df.sort_values("日期").iloc[-1]
 
+        # akshare 返回的列名是中文，版本差异大，用模糊匹配
         def pick(keys: list[str]) -> Optional[float]:
             for k in keys:
-                for col in cols:
+                for col in df.columns:
                     if k in col:
                         try:
                             val = float(latest[col])
-                            return val
                         except (ValueError, TypeError):
                             continue
+                        if val == val:  # 非 NaN 才返回，NaN 继续尝试备选列
+                            return val
             return None
 
+        report = latest["日期"]
+        report_date = (
+            report.isoformat() if hasattr(report, "isoformat") else str(report)
+        )
         return {
             "stock_code": code,
-            "report_date": str(latest.index[0]) if hasattr(latest, "index") else None,
+            "report_date": report_date,
             "revenue": None,  # 这个接口主要是比率类指标，绝对值在三大表里
             "revenue_yoy": pick(["主营业务收入增长率", "营业总收入增长率"]),
             "net_profit": None,
             "net_profit_yoy": pick(["净利润增长率", "归母净利润增长率"]),
-            "roe": pick(["净资产收益率", "ROE"]),
-            "roa": pick(["总资产报酬率", "ROA", "总资产净利率"]),
-            "gross_margin": pick(["销售毛利率", "毛利率"]),
-            "net_margin": pick(["销售净利率", "净利率"]),
+            "roe": pick(["加权净资产收益率", "净资产收益率"]),
+            "roa": pick(["总资产净利润率", "总资产利润率"]),
+            "gross_margin": pick(["销售毛利率", "主营业务利润率"]),
+            "net_margin": pick(["销售净利率"]),
             "debt_ratio": pick(["资产负债率"]),
             "current_ratio": pick(["流动比率"]),
-            "eps": pick(["每股收益", "基本每股收益"]),
-            "bps": pick(["每股净资产", "每股净资产BPS"]),
+            "eps": pick(["摊薄每股收益"]),
+            "bps": pick(["每股净资产_调整前"]),
         }
     except Exception as e:
         logger.debug(f"{code} 财务指标获取失败: {e}")
@@ -70,7 +75,7 @@ def _fetch_finance_one(code: str) -> Optional[dict]:
 
 
 def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) -> int:
-    """批量采集财务指标。全量约 10~15 分钟（4 并发）。"""
+    """批量采集财务指标。串行拉取（新浪源，约 0.5s/只），批量写入。"""
     if codes is None:
         codes = get_stock_codes()
     if limit and limit > 0:
@@ -79,71 +84,56 @@ def fetch_and_save_finance(codes: Optional[list[str]] = None, limit: int = 0) ->
     results: list[dict] = []
     logger.info(f"开始采集财务指标: {len(codes)} 只股票")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_finance_one, code): code for code in codes}
-        for i, fut in enumerate(as_completed(futures), 1):
-            res = fut.result()
-            if res:
-                results.append(res)
-            if i % 200 == 0:
-                logger.info(f"财务指标进度: {i}/{len(codes)}, 成功 {len(results)}")
+    for i, code in enumerate(codes, 1):
+        res = _fetch_finance_one(code)
+        if res:
+            results.append(res)
+        if i % 200 == 0:
+            logger.info(f"财务指标进度: {i}/{len(codes)}, 成功 {len(results)}")
 
     if not results:
         logger.warning("财务指标全部获取失败")
         return 0
 
+    # 批量写入：临时表 + 一次性 upsert，替代逐条 INSERT
+    df = pd.DataFrame(results)
+    # report_date 统一为 YYYY-MM-DD 字符串，避免类型歧义
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.date
+    # 数值列强转 float（全 None 列会被 pandas 推断为 TEXT，导致入库类型不匹配）
+    numeric_cols = [c for c in df.columns if c not in ("stock_code", "report_date")]
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
     with get_session() as sess:
-        for r in results:
-            report_date = r.get("report_date")
-            # 清洗日期格式
-            if report_date and isinstance(report_date, str):
-                try:
-                    # 可能是 "20241231" 或 "2024-12-31" 或带时间
-                    if len(report_date) == 8 and report_date.isdigit():
-                        report_date = f"{report_date[:4]}-{report_date[4:6]}-{report_date[6:8]}"
-                except Exception:
-                    report_date = None
-
-            sess.execute(text("""
-                INSERT INTO biz.finance_snapshot
-                    (stock_code, report_date, revenue, revenue_yoy, net_profit,
-                     net_profit_yoy, roe, roa, gross_margin, net_margin,
-                     debt_ratio, current_ratio, eps, bps, updated_at)
-                VALUES
-                    (:code, :report_date, :revenue, :revenue_yoy, :net_profit,
-                     :net_profit_yoy, :roe, :roa, :gross_margin, :net_margin,
-                     :debt_ratio, :current_ratio, :eps, :bps, NOW())
-                ON CONFLICT (stock_code) DO UPDATE SET
-                    report_date = EXCLUDED.report_date,
-                    revenue = EXCLUDED.revenue,
-                    revenue_yoy = EXCLUDED.revenue_yoy,
-                    net_profit = EXCLUDED.net_profit,
-                    net_profit_yoy = EXCLUDED.net_profit_yoy,
-                    roe = EXCLUDED.roe,
-                    roa = EXCLUDED.roa,
-                    gross_margin = EXCLUDED.gross_margin,
-                    net_margin = EXCLUDED.net_margin,
-                    debt_ratio = EXCLUDED.debt_ratio,
-                    current_ratio = EXCLUDED.current_ratio,
-                    eps = EXCLUDED.eps,
-                    bps = EXCLUDED.bps,
-                    updated_at = NOW()
-            """), {
-                "code": r["stock_code"],
-                "report_date": report_date,
-                "revenue": r.get("revenue"),
-                "revenue_yoy": r.get("revenue_yoy"),
-                "net_profit": r.get("net_profit"),
-                "net_profit_yoy": r.get("net_profit_yoy"),
-                "roe": r.get("roe"),
-                "roa": r.get("roa"),
-                "gross_margin": r.get("gross_margin"),
-                "net_margin": r.get("net_margin"),
-                "debt_ratio": r.get("debt_ratio"),
-                "current_ratio": r.get("current_ratio"),
-                "eps": r.get("eps"),
-                "bps": r.get("bps"),
-            })
+        conn = sess.connection()
+        df.to_sql(
+            "tmp_finance_snapshot", conn, schema="biz",
+            if_exists="replace", index=False, method="multi", chunksize=1000,
+        )
+        sess.execute(text("""
+            INSERT INTO biz.finance_snapshot
+                (stock_code, report_date, revenue, revenue_yoy, net_profit,
+                 net_profit_yoy, roe, roa, gross_margin, net_margin,
+                 debt_ratio, current_ratio, eps, bps, updated_at)
+            SELECT stock_code, CAST(report_date AS date), revenue, revenue_yoy, net_profit,
+                   net_profit_yoy, roe, roa, gross_margin, net_margin,
+                   debt_ratio, current_ratio, eps, bps, NOW()
+            FROM biz.tmp_finance_snapshot
+            ON CONFLICT (stock_code) DO UPDATE SET
+                report_date = EXCLUDED.report_date,
+                revenue = EXCLUDED.revenue,
+                revenue_yoy = EXCLUDED.revenue_yoy,
+                net_profit = EXCLUDED.net_profit,
+                net_profit_yoy = EXCLUDED.net_profit_yoy,
+                roe = EXCLUDED.roe,
+                roa = EXCLUDED.roa,
+                gross_margin = EXCLUDED.gross_margin,
+                net_margin = EXCLUDED.net_margin,
+                debt_ratio = EXCLUDED.debt_ratio,
+                current_ratio = EXCLUDED.current_ratio,
+                eps = EXCLUDED.eps,
+                bps = EXCLUDED.bps,
+                updated_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_finance_snapshot"))
 
     logger.info(f"财务指标写入完成，共 {len(results)} 只")
     return len(results)
