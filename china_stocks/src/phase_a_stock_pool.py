@@ -191,11 +191,103 @@ def _fetch_sw_l1_list() -> list[tuple[str, str]]:
     return list(_SW_L1_INDUSTRIES)
 
 
+def fetch_sw_l2_mapping() -> dict[str, str]:
+    """获取申万二级行业 → 所属一级行业映射。
+
+    返回 {二级行业代码: 一级行业名称}。
+    """
+    try:
+        df = ak.call_api("sw_index_second_info", save_raw=True)
+        mapping: dict[str, str] = {}
+        for _, row in df.iterrows():
+            l2_code = str(row.get("行业代码", "")).split(".")[0].strip()
+            l1_name = str(row.get("一级行业名称", "")).strip()
+            if l2_code and l1_name:
+                mapping[l2_code] = l1_name
+        return mapping
+    except Exception as e:
+        logger.warning(f"sw_index_second_info 获取失败: {e}")
+        return {}
+
+
+def fetch_sw_l2_industry() -> pd.DataFrame:
+    """获取申万二级行业成分股 → 股票-二级行业映射。
+
+    流程：先拿二级行业列表，再逐个行业拉成分股，
+    汇总成 stock_code → industry_l2 映射 + 所属一级行业。
+    返回 DataFrame：stock_code, stock_name, industry_l1, industry_l2。
+    """
+    # 1. 获取二级行业列表
+    l2_list = _fetch_sw_l2_list()
+    if not l2_list:
+        logger.warning("申万二级行业列表为空，跳过")
+        return pd.DataFrame()
+
+    # 2. 获取二级→一级行业映射
+    l2_to_l1 = fetch_sw_l2_mapping()
+
+    frames: list[pd.DataFrame] = []
+    for code, name in l2_list:
+        try:
+            cons = ak.call_api("index_component_sw", save_raw=False, symbol=code)
+            if cons.empty:
+                logger.debug(f"申万二级行业 {code} {name} 无成分股")
+                continue
+
+            col_map = _find_columns(cons.columns.tolist(), {
+                "code": ["证券代码", "股票代码", "代码", "code"],
+                "name": ["证券名称", "股票名称", "名称", "name"],
+            })
+            if not col_map.get("code"):
+                logger.debug(f"申万二级行业 {code} {name} 字段无法识别")
+                continue
+
+            sub = pd.DataFrame()
+            sub["stock_code"] = cons[col_map["code"]].astype(str).str.zfill(6)
+            sub["stock_name"] = (
+                cons[col_map["name"]].astype(str)
+                if col_map.get("name")
+                else cons[col_map["code"]].astype(str).str.zfill(6)
+            )
+            sub["industry_l1"] = l2_to_l1.get(code, "")
+            sub["industry_l2"] = name
+            frames.append(sub)
+        except Exception as e:
+            logger.debug(f"申万二级行业 {code} {name} 成分股拉取失败: {e}")
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+    logger.info(f"申万二级行业成分股汇总: {len(out)} 只股票覆盖 {len(l2_list)} 个二级行业")
+    return out
+
+
+def _fetch_sw_l2_list() -> list[tuple[str, str]]:
+    """获取申万二级行业列表 (代码, 名称)。"""
+    try:
+        df = ak.call_api("sw_index_second_info", save_raw=True)
+        result: list[tuple[str, str]] = []
+        for _, row in df.iterrows():
+            code = str(row["行业代码"]).split(".")[0].strip()
+            name = str(row["行业名称"]).strip()
+            if code and name:
+                result.append((code, name))
+        if result:
+            logger.info(f"申万二级行业分类获取成功: {len(result)} 个")
+            return result
+    except Exception as e:
+        logger.warning(f"sw_index_second_info 失败: {e}")
+
+    return []
+
+
 def fetch_sw_industry() -> pd.DataFrame:
     """获取申万一级行业成分股 → 股票-行业映射。
 
     流程：先拿一级行业列表，再逐个行业拉成分股（index_component_sw，申万宏源源，稳定），
-    汇总成 stock_code → industry_l1 映射。l2/l3 暂留空（后续可用三级行业接口补全）。
+    汇总成 stock_code → industry_l1 映射。l2/l3 暂留空。
     """
     l1_list = _fetch_sw_l1_list()
     if not l1_list:
@@ -419,6 +511,39 @@ def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 100) 
     return updated
 
 
+def update_industry_l2(flush_every: int = 100) -> int:
+    """批量更新 core.stock.primary_industry_l2（申万二级行业，P2-2 修复）。
+
+    使用 sw_index_second_info + index_component_sw 逐行业拉取，
+    映射到 core.stock。返回更新行数。
+    """
+    l2_df = fetch_sw_l2_industry()
+    if l2_df.empty:
+        logger.warning("申万二级行业数据为空，跳过更新")
+        return 0
+
+    updated = 0
+    with get_session() as sess:
+        conn = sess.connection()
+        l2_df[["stock_code", "industry_l2"]].to_sql(
+            "tmp_industry_l2", conn, schema="core",
+            if_exists="replace", index=False, method="multi", chunksize=1000,
+        )
+        r = sess.execute(text("""
+            UPDATE core.stock s
+            SET primary_industry_l2 = t.industry_l2,
+                updated_at = NOW()
+            FROM core.tmp_industry_l2 t
+            WHERE s.stock_code = t.stock_code
+              AND s.primary_industry_l2 IS DISTINCT FROM t.industry_l2
+        """))
+        updated = r.rowcount
+        sess.execute(text("DROP TABLE IF EXISTS core.tmp_industry_l2"))
+
+    logger.info(f"二级行业更新完成: {updated} 只")
+    return updated
+
+
 def run_phase_a() -> None:
     """完整执行 Phase A。"""
     run = start_run(platform_code="akshare", phase="phase_a", target="all")
@@ -445,6 +570,13 @@ def run_phase_a() -> None:
             logger.info(f"上市日期更新: {list_date_count} 只")
         except Exception as e:
             logger.warning(f"上市日期更新失败（将跳过）: {e}")
+
+        # 5. 更新二级行业（P2-2 修复，失败不影响主流程）
+        try:
+            l2_count = update_industry_l2()
+            logger.info(f"二级行业更新: {l2_count} 只")
+        except Exception as e:
+            logger.warning(f"二级行业更新失败（将跳过）: {e}")
 
         # 三态判定：Phase A 是源头，写入行数为 0 说明异常
         total_rows = inserted + list_count + sw_count

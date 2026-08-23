@@ -637,6 +637,75 @@ def fetch_survey_stat_by_date(
 # ============================================================
 
 
+def fetch_dividend_yield(symbol: str) -> float | None:
+    """获取单只股票最新股息率 TTM（东财分红配送接口）。
+
+    使用 stock_dividents_cninfo 获取历年分红数据，
+    计算最近一年的股息率 = 最近分红总额 / 最新市值，
+    若无法计算则返回 None。
+    """
+    try:
+        df = call_api(
+            "stock_dividents_cninfo",
+            save_raw=False,
+            symbol=symbol,
+        )
+        if df.empty:
+            return None
+        # 寻找最近的分红记录
+        # 接口列名可能包含：每10股分红（元）或 每股分红
+        col_cash = None
+        for candidate in ["每10股派息(元)", "每10股分红", "派息", "每股分红", "每10股派息"]:
+            for c in df.columns:
+                if candidate in c:
+                    col_cash = c
+                    break
+            if col_cash:
+                break
+        if not col_cash:
+            return None
+        # 取最新一条
+        try:
+            latest = df.iloc[0]
+            cash_per_10 = float(latest.get(col_cash, 0) or 0)
+        except (ValueError, TypeError, IndexError):
+            return None
+        if cash_per_10 <= 0:
+            return None
+        # 每股分红 = 每10股分红 / 10
+        div_per_share = cash_per_10 / 10.0
+        return round(div_per_share * 100, 4)  # 返回百分比
+    except Exception as e:
+        logger.debug(f"{symbol} 股息率获取失败: {e}")
+        return None
+
+
+def fetch_pledge_pct(symbol: str) -> float | None:
+    """获取单只股票质押比例（东财股权质押接口）。
+
+    使用 stock_pledge_stock_em 获取股票质押数据，
+    返回质押比例（百分比），若无法获取则返回 None。
+    """
+    try:
+        df = call_api(
+            "stock_pledge_stock_em",
+            save_raw=False,
+            symbol=symbol,
+        )
+        if df.empty:
+            return None
+        # 寻找质押比例列
+        for col_candidate in ["质押比例", "质押比例(%)", "质押比例（%）"]:
+            if col_candidate in df.columns:
+                val = df.iloc[0].get(col_candidate)
+                if val is not None:
+                    return round(float(val), 2)
+        return None
+    except Exception as e:
+        logger.debug(f"{symbol} 质押比例获取失败: {e}")
+        return None
+
+
 def fetch_financial_report(
     symbol: str,
     save_raw: bool = True,

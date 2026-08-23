@@ -31,6 +31,8 @@ def _estimate_inst_hold_pct(holders: list[dict]) -> Optional[float]:
     """根据前十大股东名称估算机构持仓占比（粗略）。"""
     inst_keywords = [
         "基金", "社保", "保险", "QFII", "券商", "资产管理", "信托", "银行", "养老",
+        "投资公司", "投资管理", "证券投资", "资本管理", "企业年金",
+        "全国社保", "基本养老保险", "保险产品", "保险资金",
     ]
     total_pct = 0.0
     found = False
@@ -97,6 +99,7 @@ def _fetch_profile(code: str) -> Optional[dict]:
         "holders": holders,
         "shareholder_count": shareholder_count,
         "inst_hold_pct": _estimate_inst_hold_pct(holders),
+        "pledge_pct": ak.fetch_pledge_pct(symbol=code),
     }
 
 
@@ -163,7 +166,7 @@ def _flush_shareholders(results: list[dict]) -> int:
             "report_date": p["report_date"],
             "top10_json": json.dumps(full_json, ensure_ascii=False),
             "inst_hold_pct": p["inst_hold_pct"],
-            "pledge_pct": None,
+            "pledge_pct": p.get("pledge_pct"),
         })
 
     df = pd.DataFrame(rows)

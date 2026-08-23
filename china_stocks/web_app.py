@@ -747,9 +747,13 @@ def api_stock_shareholders(code):
             "inst_hold_pct": float(row.inst_hold_pct)
             if row.inst_hold_pct is not None
             else None,
-            # 质押率：新浪单接口不提供，始终为 None，前端需标注「暂无数据」
-            "pledge_pct": None,
-            "pledge_note": "质押率数据源未提供（新浪股东接口不含质押信息），暂无法展示",
+            # 质押率：东财股权质押接口（stock_pledge_stock_em）
+            "pledge_pct": float(row.pledge_pct)
+            if row.pledge_pct is not None
+            else None,
+            "pledge_note": "质押率数据源未提供，暂无法展示"
+            if row.pledge_pct is None
+            else None,
             "top10": [
                 {
                     "name": h.get("name"),
@@ -1075,9 +1079,14 @@ def api_tasks_list():
             "desc": "core.stock.list_date 补全（补 P2-1）",
         },
         {
+            "id": "industry_l2",
+            "name": "Phase A: 二级行业补全",
+            "desc": "申万二级行业成分股映射（补 P2-2）",
+        },
+        {
             "id": "shareholder",
             "name": "Phase C: 股东画像",
-            "desc": "十大股东 + 股东户数 + 机构持股估算（质押率数据源未提供，暂无法展示）",
+            "desc": "十大股东 + 股东户数 + 机构持股估算 + 质押率（东财接口）",
         },
         {
             "id": "announcements",
@@ -1157,6 +1166,12 @@ def api_trigger_task():
             lambda: __import__(
                 "china_stocks.src.phase_a_stock_pool", fromlist=["update_list_date"]
             ).update_list_date(),
+        ),
+        "industry_l2": (
+            "Phase A-二级行业补全",
+            lambda: __import__(
+                "china_stocks.src.phase_a_stock_pool", fromlist=["update_industry_l2"]
+            ).update_industry_l2(),
         ),
         "shareholder": (
             "Phase C-股东画像",
@@ -1876,7 +1891,11 @@ async function renderStockDetail(params) {
         <div class="card p-5">
           <h3 class="font-bold mb-4">资金面</h3>
           <div class="space-y-3">
-            <div class="flex justify-between"><span class="text-gray-500">北向持股占比</span><span class="font-medium">${fmtPct(c.north_hold_pct)}</span></div>
+            <div class="flex justify-between"><span class="text-gray-500">北向持股占比</span>
+              ${c.north_hold_pct != null
+                ? `<span class="font-medium">${fmtPct(c.north_hold_pct)}</span>`
+                : '<span class="text-xs text-gray-400">港交所 2024-08 起停披露</span>'}
+            </div>
             <div class="flex justify-between"><span class="text-gray-500">融资余额</span><span class="font-medium">${fmtMoney(c.margin_balance)}</span></div>
           </div>
         </div>
@@ -1944,10 +1963,10 @@ async function loadShareholders(code) {
       </div>
       <div class="bg-gray-50 rounded p-3">
         <div class="text-gray-500 text-sm">质押率</div>
-        <div class="text-lg font-bold mt-1 text-gray-300" title="${data.pledge_note || ''}">暂无数据</div>
+        <div class="text-lg font-bold mt-1 ${data.pledge_pct != null ? 'text-gray-900' : 'text-gray-300'}" title="${data.pledge_note || ''}">${data.pledge_pct != null ? data.pledge_pct.toFixed(2) + '%' : '暂无数据'}</div>
       </div>
     </div>
-    <div class="text-xs text-amber-600 mb-3">⚠️ ${data.pledge_note || '质押率数据源未提供'}</div>
+    ${data.pledge_note ? `<div class="text-xs text-amber-600 mb-3">⚠️ ${data.pledge_note}</div>` : ''}
     <table class="w-full text-sm">
       <thead class="bg-gray-50 border-b">
         <tr>
@@ -2613,7 +2632,7 @@ function resetScreener() {
   ['min-cap', 'max-cap', 'min-pe', 'max-pe', 'min-pb', 'max-pb',
    'min-change', 'max-change', 'min-roe', 'max-roe', 'min-turn', 'max-turn'
   ].forEach(id => { const el = document.getElementById('scr-' + id); if (el) el.value = ''; });
-  const oi = document.getElementById('scr-only-interim'); if (oi) oi.checked = false;
+  const oi = document.getElementById('scr-only-interim'); if (oi) oi.checked = true; // 默认勾选，避免混报告期
   screenerPage = 1;
   document.getElementById('screener-results').innerHTML =
     '<div class="text-center text-gray-400 py-12">设置条件后点击"开始筛选"</div>';

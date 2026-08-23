@@ -172,8 +172,92 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
     return len(val_df)
 
 
+def fetch_and_save_dividend(codes: list[str], flush_every: int = 200) -> int:
+    """批量采集股息率 dv_ttm（P2-4 修复）。
+
+    逐只股票调用 fetch_dividend_yield，
+    写入 biz.stock_basic.dv_ttm。
+    """
+    results: list[dict] = []
+    total = 0
+    logger.info(f"开始采集股息率: {len(codes)} 只股票")
+
+    for i, code in enumerate(codes, 1):
+        dv = ak.fetch_dividend_yield(symbol=code)
+        if dv is not None:
+            results.append({"stock_code": code, "dv_ttm": dv})
+        if i % 100 == 0:
+            logger.info(f"股息率进度: {i}/{len(codes)}")
+
+        if len(results) >= flush_every:
+            total += _batch_update_dividend(results)
+            results = []
+
+    if results:
+        total += _batch_update_dividend(results)
+
+    logger.info(f"股息率采集完成: {total} 只")
+    return total
+
+
+def _batch_update_dividend(results: list[dict]) -> int:
+    """批量写入股息率到 biz.stock_basic。"""
+    if not results:
+        return 0
+    df = pd.DataFrame(results)
+    with get_session() as sess:
+        conn = sess.connection()
+        df.to_sql(
+            "tmp_dv", conn, schema="biz",
+            if_exists="replace", index=False, method="multi", chunksize=1000,
+        )
+        r = sess.execute(text("""
+            UPDATE biz.stock_basic b
+            SET dv_ttm = t.dv_ttm, updated_at = NOW()
+            FROM biz.tmp_dv t
+            WHERE b.stock_code = t.stock_code
+              AND b.dv_ttm IS DISTINCT FROM t.dv_ttm
+        """))
+        updated = r.rowcount
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_dv"))
+    return updated
+
+
+def update_ps_ttm() -> int:
+    """根据营收和市值计算市销率 ps_ttm（P2-4 修复）。
+
+    ps_ttm = total_market_cap / revenue（最新报告期）
+    需要 P0-2 跑通（revenue 有数据）后才能生效。
+    """
+    with get_session() as sess:
+        r = sess.execute(text("""
+            UPDATE biz.stock_basic b
+            SET ps_ttm = CASE
+                    WHEN f.revenue IS NOT NULL AND f.revenue > 0
+                         AND b.total_market_cap IS NOT NULL AND b.total_market_cap > 0
+                    THEN ROUND((b.total_market_cap / f.revenue)::numeric, 4)
+                    ELSE NULL
+                END,
+                updated_at = NOW()
+            FROM biz.finance_snapshot f
+            WHERE b.stock_code = f.stock_code
+              AND (
+                  (f.revenue IS NOT NULL AND f.revenue > 0
+                   AND b.total_market_cap IS NOT NULL AND b.total_market_cap > 0
+                   AND b.ps_ttm IS DISTINCT FROM ROUND((b.total_market_cap / f.revenue)::numeric, 4))
+                  OR
+                  ((f.revenue IS NULL OR f.revenue <= 0
+                    OR b.total_market_cap IS NULL OR b.total_market_cap <= 0)
+                   AND b.ps_ttm IS NOT NULL)
+              )
+        """))
+        updated = r.rowcount
+    logger.info(f"市销率更新: {updated} 只")
+    return updated
+
+
 def run_stock_basic() -> None:
-    """刷新 biz.stock_basic（行情 + 估值）。"""
+    """刷新 biz.stock_basic（行情 + 估值 + 股息率 + 市销率）。"""
     run = start_run(platform_code="akshare", phase="phase_c_stock_basic")
     try:
         # 检查上游依赖：core.stock 是否有数据
@@ -189,6 +273,20 @@ def run_stock_basic() -> None:
 
         count = build_stock_basic_from_daily()
         val_count = fetch_and_save_valuation(codes=stock_codes)
+
+        # P2-4 修复：更新股息率 dv_ttm（失败不影响主流程）
+        try:
+            dv_count = fetch_and_save_dividend(codes=stock_codes)
+            logger.info(f"股息率更新: {dv_count} 只")
+        except Exception as e:
+            logger.warning(f"股息率更新失败（将跳过）: {e}")
+
+        # P2-4 修复：更新市销率 ps_ttm（失败不影响主流程）
+        try:
+            ps_count = update_ps_ttm()
+            logger.info(f"市销率更新: {ps_count} 只")
+        except Exception as e:
+            logger.warning(f"市销率更新失败（将跳过）: {e}")
 
         # 三态判定
         status, err_msg = determine_status(
