@@ -386,8 +386,9 @@ def fetch_announcements_by_date(
     sess.headers.update({"User-Agent": BROWSER_UA})
 
     rows: list[dict] = []
+    max_pages = 100  # page_size=100 → 单日最多 10,000 条，避免极端披露日静默截断
     page = 0
-    while page < 100:
+    while page < max_pages:
         params = {**base_params, "page_index": str(page)}
         try:
             j = _em_get_json(sess, url, params)
@@ -419,6 +420,13 @@ def fetch_announcements_by_date(
                 "公告链接": ann_link,
             })
         if len(lst) < 100:
+            break
+        if page + 1 >= max_pages:
+            # 末页仍满页：单日公告数已触 10,000 上限，继续翻页无意义，告警后停止以防静默截断
+            logger.warning(
+                f"公告拉取 date={trade_date} 已达分页上限 {max_pages * 100} 条，"
+                f"单日公告可能超过上限被截断，请关注"
+            )
             break
         page += 1
         time.sleep(0.2)
