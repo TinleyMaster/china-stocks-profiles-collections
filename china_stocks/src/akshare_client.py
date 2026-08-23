@@ -637,47 +637,46 @@ def fetch_survey_stat_by_date(
 # ============================================================
 
 
-def fetch_dividend_yield(symbol: str) -> float | None:
-    """获取单只股票最新股息率 TTM（东财分红配送接口）。
+def fetch_cash_dividend_per_10(symbol: str) -> float | None:
+    """获取单只股票最新已实施现金分红（每10股派息，元）。
 
-    使用 stock_dividents_cninfo 获取历年分红数据，
-    计算最近一年的股息率 = 最近分红总额 / 最新市值，
-    若无法计算则返回 None。
+    调用 akshare stock_dividend_cninfo（巨潮资讯历史分红接口）。
+    取最新一条含现金分红（派息比例 > 0）的记录，返回「派息比例」
+    （每10股派息，元）。注意：本函数只返回分红基数，真正的股息率
+    dv_ttm = (派息比例 / 10) / 最新收盘价 × 100，由调用方结合价格计算。
+
+    无分红数据返回 None；接口/网络异常直接抛出（由调用方统计留痕，去静默）。
     """
-    try:
-        df = call_api(
-            "stock_dividents_cninfo",
-            save_raw=False,
-            symbol=symbol,
-        )
-        if df.empty:
-            return None
-        # 寻找最近的分红记录
-        # 接口列名可能包含：每10股分红（元）或 每股分红
-        col_cash = None
-        for candidate in ["每10股派息(元)", "每10股分红", "派息", "每股分红", "每10股派息"]:
-            for c in df.columns:
-                if candidate in c:
-                    col_cash = c
-                    break
-            if col_cash:
-                break
-        if not col_cash:
-            return None
-        # 取最新一条
-        try:
-            latest = df.iloc[0]
-            cash_per_10 = float(latest.get(col_cash, 0) or 0)
-        except (ValueError, TypeError, IndexError):
-            return None
-        if cash_per_10 <= 0:
-            return None
-        # 每股分红 = 每10股分红 / 10
-        div_per_share = cash_per_10 / 10.0
-        return round(div_per_share * 100, 4)  # 返回百分比
-    except Exception as e:
-        logger.debug(f"{symbol} 股息率获取失败: {e}")
+    df = call_api(
+        "stock_dividend_cninfo",  # 修正：原 stock_dividents_cninfo 为笔误，接口不存在→100% 静默失败
+        save_raw=True,
+        symbol=symbol,
+    )
+    if df is None or df.empty:
         return None
+
+    # 真实返回列含「派息比例」（每10股派息，元）；兼容历史列名写法
+    col_cash = None
+    for candidate in ["派息比例", "每10股派息(元)", "每10股分红", "派息", "每股分红", "每10股派息"]:
+        for c in df.columns:
+            if candidate in c:
+                col_cash = c
+                break
+        if col_cash:
+            break
+    if not col_cash:
+        logger.warning(f"{symbol} 分红接口无现金派息列，实际列={list(df.columns)}")
+        return None
+
+    # df 按报告时间倒序，取最新一条有现金分红的记录
+    for _, row in df.iterrows():
+        try:
+            cash = float(row.get(col_cash) or 0)
+        except (ValueError, TypeError):
+            cash = 0.0
+        if cash > 0:
+            return round(cash, 4)
+    return None
 
 
 def fetch_pledge_pct(symbol: str) -> float | None:

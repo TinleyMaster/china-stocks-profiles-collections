@@ -172,21 +172,60 @@ def fetch_and_save_valuation(codes: Optional[list[str]] = None, limit: int = 0) 
     return len(val_df)
 
 
+def _load_close_prices() -> dict[str, float]:
+    """一次性取出 biz.stock_basic 的最新收盘价（作为股息率分母）。"""
+    price_map: dict[str, float] = {}
+    with get_session() as sess:
+        rows = sess.execute(text(
+            "SELECT stock_code, close FROM biz.stock_basic "
+            "WHERE close IS NOT NULL AND close > 0"
+        )).fetchall()
+    for r in rows:
+        price_map[r[0]] = float(r[1])
+    return price_map
+
+
 def fetch_and_save_dividend(codes: list[str], flush_every: int = 200) -> int:
     """批量采集股息率 dv_ttm（P2-4 修复）。
 
-    逐只股票调用 fetch_dividend_yield，
+    逐只股票获取最新已实施现金分红（每10股派息），
+    结合 biz.stock_basic 的最新收盘价计算股息率：
+        dv_ttm(%) = (每10股派息 / 10) / 收盘价 × 100
     写入 biz.stock_basic.dv_ttm。
+
+    去静默：统计 failed（接口/解析异常）与 skipped（无分红/无价），
+    并在日志中明确反映，不再用 blanket try/except 吞掉整个采集。
     """
     results: list[dict] = []
     total = 0
-    logger.info(f"开始采集股息率: {len(codes)} 只股票")
+    failed = 0
+    skipped = 0
+
+    price_map = _load_close_prices()
+    logger.info(f"开始采集股息率: {len(codes)} 只股票, 其中有收盘价 {len(price_map)} 只")
 
     for i, code in enumerate(codes, 1):
-        dv = ak.fetch_dividend_yield(symbol=code)
-        if dv is not None:
-            results.append({"stock_code": code, "dv_ttm": dv})
-        if i % 100 == 0:
+        try:
+            cash_per_10 = ak.fetch_cash_dividend_per_10(symbol=code)
+        except Exception as e:  # noqa: BLE001 - 真实异常需留痕
+            failed += 1
+            logger.warning(f"{code} 股息率采集异常: {e}")
+            continue
+
+        if cash_per_10 is None:
+            skipped += 1
+            continue
+
+        price = price_map.get(code)
+        if not price or price <= 0:
+            skipped += 1
+            continue
+
+        div_per_share = cash_per_10 / 10.0
+        dv_ttm = round(div_per_share / price * 100, 4)
+        results.append({"stock_code": code, "dv_ttm": dv_ttm})
+
+        if i % 500 == 0:
             logger.info(f"股息率进度: {i}/{len(codes)}")
 
         if len(results) >= flush_every:
@@ -196,7 +235,9 @@ def fetch_and_save_dividend(codes: list[str], flush_every: int = 200) -> int:
     if results:
         total += _batch_update_dividend(results)
 
-    logger.info(f"股息率采集完成: {total} 只")
+    # 去静默：明确汇报成功/跳过/异常
+    level = logger.warning if failed > 0 else logger.info
+    level(f"股息率采集完成: 写入 {total} 只, 无分红/无价跳过 {skipped} 只, 异常 {failed} 只")
     return total
 
 
