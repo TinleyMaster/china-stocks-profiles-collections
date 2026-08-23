@@ -29,12 +29,36 @@ DEFAULT_TIMEOUT_MINUTES = 120
 def start_run(platform_code: str, phase: str, target: str | None = None) -> IngestRun:
     """启动一次采集任务，返回 run 对象。
 
-    启动前会先回收同 phase 的僵尸 running 任务（超时熔断）。
+    启动前会先回收同 phase 的僵尸 running 任务（超时熔断），
+    然后检查是否已有同 phase 的 running 任务（防并发重入），
+    如有则直接 skipped 返回。
     """
     # 先回收同 phase 的僵尸任务
     reap_stale_runs(phase=phase)
 
     with get_session() as sess:
+        # 检查是否已有同 phase 的 running 任务（防并发重入）
+        existing = sess.execute(
+            text("""
+                SELECT 1 FROM sys.ingest_run
+                WHERE phase = :phase AND status = 'running'
+                LIMIT 1
+            """),
+            {"phase": phase},
+        ).fetchone()
+        if existing:
+            logger.warning(f"phase={phase} 已有 running 任务，跳过本次启动（防并发重入）")
+            # 插入一条 skipped 记录并返回
+            row = sess.execute(
+                text("""
+                    INSERT INTO sys.ingest_run (platform_code, phase, target, status)
+                    VALUES (:pc, :phase, :target, 'skipped')
+                    RETURNING run_id
+                """),
+                {"pc": platform_code, "phase": phase, "target": target},
+            ).fetchone()
+            return IngestRun(run_id=row[0], platform_code=platform_code, phase=phase, target=target)
+
         row = sess.execute(
             text("""
                 INSERT INTO sys.ingest_run (platform_code, phase, target, status)

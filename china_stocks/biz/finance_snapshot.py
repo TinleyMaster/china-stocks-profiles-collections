@@ -8,6 +8,7 @@ biz 层：财务指标画像 biz.finance_snapshot
 """
 from __future__ import annotations
 
+import json
 import time
 from datetime import date as dt_date
 from typing import Optional
@@ -248,6 +249,165 @@ def run_finance_snapshot() -> None:
             logger.warning(f"财务指标刷新结束，状态: {status}，原因: {err_msg}")
     except Exception as e:
         logger.exception(f"财务指标刷新失败: {e}")
+        finish_run(run, status="failed", error_msg=str(e))
+        raise
+
+
+# ============================================================
+# P0-2 修复：财务三大表绝对值（营收 / 净利润）
+# ============================================================
+
+
+def _save_financial_report_to_src(results: list[dict]) -> int:
+    """将财务三大表数据写入 src_akshare.financial_report（中间层留痕）。
+
+    按 stock_code + report_date + report_type 三列 upsert，
+    其中 report_type 固定为 'income'（利润表摘要）。
+    """
+    if not results:
+        return 0
+    df = pd.DataFrame(results)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.date
+    df["report_type"] = "income"
+    df["report_json"] = df.apply(
+        lambda r: json.dumps({
+            "营业收入": r.get("revenue"),
+            "营业总收入": r.get("total_revenue"),
+            "净利润": r.get("net_profit"),
+            "归母净利润": r.get("net_profit_parent"),
+        }, ensure_ascii=False),
+        axis=1,
+    )
+
+    with get_session() as sess:
+        conn = sess.connection()
+        src_df = df[["stock_code", "report_date", "report_type", "report_json"]]
+        src_df.to_sql(
+            "tmp_financial_report", conn, schema="src_akshare",
+            if_exists="replace", index=False, method="multi", chunksize=1000,
+        )
+        sess.execute(text("""
+            INSERT INTO src_akshare.financial_report
+                (stock_code, report_date, report_type, report_json)
+            SELECT stock_code, CAST(report_date AS date), report_type, CAST(report_json AS jsonb)
+            FROM src_akshare.tmp_financial_report
+            ON CONFLICT (stock_code, report_date, report_type) DO UPDATE SET
+                report_json = EXCLUDED.report_json,
+                fetched_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS src_akshare.tmp_financial_report"))
+    logger.info(f"src_akshare.financial_report 写入完成: {len(results)} 条")
+    return len(results)
+
+
+def _update_finance_snapshot_abs(results: list[dict]) -> int:
+    """将财务三大表的营收/净利润回写到 biz.finance_snapshot。
+
+    取最新报告期的 revenue 和 net_profit 写入。
+    """
+    if not results:
+        return 0
+    df = pd.DataFrame(results)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.date
+    df["revenue"] = pd.to_numeric(df.get("revenue"), errors="coerce")
+    df["net_profit"] = pd.to_numeric(df.get("net_profit"), errors="coerce")
+
+    # 按 stock_code 取最新报告期
+    df = df.sort_values("report_date").groupby("stock_code").last().reset_index()
+
+    with get_session() as sess:
+        conn = sess.connection()
+        df[["stock_code", "revenue", "net_profit"]].to_sql(
+            "tmp_finance_abs", conn, schema="biz",
+            if_exists="replace", index=False, method="multi", chunksize=1000,
+        )
+        sess.execute(text("""
+            INSERT INTO biz.finance_snapshot
+                (stock_code, revenue, net_profit, updated_at)
+            SELECT stock_code, revenue, net_profit, NOW()
+            FROM biz.tmp_finance_abs
+            ON CONFLICT (stock_code) DO UPDATE SET
+                revenue = EXCLUDED.revenue,
+                net_profit = EXCLUDED.net_profit,
+                updated_at = NOW()
+        """))
+        sess.execute(text("DROP TABLE IF EXISTS biz.tmp_finance_abs"))
+    logger.info(f"biz.finance_snapshot 绝对值更新完成: {len(df)} 只")
+    return len(df)
+
+
+def fetch_and_save_financial_report(
+    codes: Optional[list[str]] = None, limit: int = 0, flush_every: int = 200
+) -> int:
+    """批量采集财务三大表绝对值（营收 / 净利润）。
+
+    每只股票一次 API 调用，结果写入：
+    1. src_akshare.financial_report（中间层留痕）
+    2. biz.finance_snapshot.revenue / net_profit（业务层）
+    """
+    if codes is None:
+        codes = get_stock_codes()
+    if limit and limit > 0:
+        codes = codes[:limit]
+
+    results: list[dict] = []
+    total_saved = 0
+    logger.info(f"开始采集财务三大表绝对值: {len(codes)} 只股票")
+
+    for i, code in enumerate(codes, 1):
+        try:
+            df = ak.fetch_financial_report(symbol=code)
+            if df.empty:
+                continue
+            # 取最新一期报告（排序后取最后一条）
+            latest = df.sort_values("报告期").iloc[-1]
+            results.append({
+                "stock_code": code,
+                "report_date": str(latest.get("报告期", ""))[:10],
+                "revenue": latest.get("营业收入") or latest.get("营业总收入"),
+                "total_revenue": latest.get("营业总收入"),
+                "net_profit": latest.get("归母净利润") or latest.get("净利润"),
+                "net_profit_parent": latest.get("归母净利润"),
+            })
+        except Exception as e:
+            logger.debug(f"{code} 财务三大表拉取失败: {e}")
+
+        if i % 100 == 0:
+            logger.info(f"财务三大表进度: {i}/{len(codes)}")
+
+        if len(results) >= flush_every:
+            _save_financial_report_to_src(results)
+            _update_finance_snapshot_abs(results)
+            total_saved += len(results)
+            results = []
+
+    if results:
+        _save_financial_report_to_src(results)
+        _update_finance_snapshot_abs(results)
+        total_saved += len(results)
+
+    logger.info(f"财务三大表绝对值采集完成: {total_saved} 只")
+    return total_saved
+
+
+def run_financial_report() -> None:
+    """执行财务三大表绝对值采集。"""
+    run = start_run(platform_code="akshare", phase="phase_c_financial_report")
+    try:
+        stock_codes = get_stock_codes()
+        if not stock_codes:
+            finish_run(run, status="skipped", error_msg="core.stock 为空")
+            return
+
+        count = fetch_and_save_financial_report(codes=stock_codes)
+        status, err_msg = determine_status(
+            rows_inserted=count, expected_min_rows=1,
+        )
+        finish_run(run, status=status, rows_inserted=count, error_msg=err_msg)
+        if status != "success":
+            logger.warning(f"财务三大表采集结束，状态: {status}，原因: {err_msg}")
+    except Exception as e:
+        logger.exception(f"财务三大表采集失败: {e}")
         finish_run(run, status="failed", error_msg=str(e))
         raise
 

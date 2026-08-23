@@ -80,13 +80,13 @@ def build_scheduler() -> BlockingScheduler:
 
     # 延迟导入，避免循环依赖
     from .src.phase_a_stock_pool import run_phase_a
-    from .src.phase_b_daily import run_phase_daily
+    from .src.phase_b_daily import run_phase_daily_batched
     from .src.phase_b2_announcements import run_phase_b2_announcements
     from .src.phase_b2_download import run_download_announcements
     from .src.phase_b3_research import run_phase_b3_research
     from .src.phase_b3_survey import run_phase_b3_survey
     from .biz.stock_basic import run_stock_basic
-    from .biz.finance_snapshot import run_finance_snapshot
+    from .biz.finance_snapshot import run_finance_snapshot, run_financial_report
     from .biz.capital_snapshot import run_capital_snapshot
     from .biz.shareholder_snapshot import run_shareholder_snapshot
     from .biz.research_notebook import run_build_notebooks
@@ -102,9 +102,9 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1,
     )
 
-    # 每日 16:00 — 日线行情（收盘后）
+    # 每日 16:00 — 日线行情（收盘后，按前缀分块）
     scheduler.add_job(
-        lambda: run_with_alert("Phase B-日线行情", run_phase_daily),
+        lambda: run_with_alert("Phase B-日线行情（分块）", run_phase_daily_batched),
         CronTrigger(hour=16, minute=0, timezone=TIMEZONE),
         id="phase_b_daily",
         misfire_grace_time=7200,
@@ -120,11 +120,20 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1,
     )
 
-    # 每周一 20:00 — 财务指标
+    # 每周一 20:00 — 财务指标（比率类）
     scheduler.add_job(
         lambda: run_with_alert("Phase C-财务指标", run_finance_snapshot),
         CronTrigger(day_of_week="mon", hour=20, minute=0, timezone=TIMEZONE),
         id="phase_c_finance",
+        misfire_grace_time=86400,
+        max_instances=1,
+    )
+
+    # 每周一 21:00 — 财务三大表绝对值（营收/净利润，P0-2 修复）
+    scheduler.add_job(
+        lambda: run_with_alert("Phase C-财务三大表绝对值", run_financial_report),
+        CronTrigger(day_of_week="mon", hour=21, minute=0, timezone=TIMEZONE),
+        id="phase_c_financial_report",
         misfire_grace_time=86400,
         max_instances=1,
     )

@@ -39,6 +39,21 @@ from .logging_setup import logger
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False  # 中文正常显示
 
+# ── API Key 鉴权 ──────────────────────────────────────────────
+_API_KEY = os.getenv("API_KEY", "")
+
+
+def _require_api_key():
+    """检查 X-API-Key 请求头是否匹配环境变量 API_KEY。
+
+    如果 API_KEY 环境变量未设置，则跳过鉴权（兼容本地开发/无鉴权场景）。
+    """
+    if not _API_KEY:
+        return  # 未配置 API_KEY，跳过鉴权
+    key = request.headers.get("X-API-Key", "")
+    if key != _API_KEY:
+        return jsonify({"error": "未授权：缺少或无效的 API Key"}), 401
+
 # 信任反向代理转发的协议头（Zeabur 边缘终止 TLS 后需要）
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -864,6 +879,9 @@ def api_docs_list():
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
     """RAG 问答。"""
+    auth_resp = _require_api_key()
+    if auth_resp:
+        return auth_resp
     from .biz.rag import ask_stock
 
     data = request.get_json() or {}
@@ -956,6 +974,9 @@ def api_watchlist():
 @app.route("/api/watchlist", methods=["POST"])
 def api_watchlist_add():
     """添加自选股。"""
+    auth_resp = _require_api_key()
+    if auth_resp:
+        return auth_resp
     data = request.get_json() or {}
     code = data.get("code", "").strip().zfill(6)
     if not code:
@@ -989,6 +1010,9 @@ def api_watchlist_add():
 @app.route("/api/watchlist/<code>", methods=["DELETE"])
 def api_watchlist_remove(code):
     """移除自选股。"""
+    auth_resp = _require_api_key()
+    if auth_resp:
+        return auth_resp
     code = code.zfill(6)
     with get_session() as sess:
         sess.execute(
@@ -1041,6 +1065,16 @@ def api_tasks_list():
         },
         {"id": "capital", "name": "Phase C: 资金面画像", "desc": "北向 + 融资融券"},
         {
+            "id": "financial_report",
+            "name": "Phase C: 财务三大表绝对值",
+            "desc": "营收/净利润绝对值（补 P0-2）",
+        },
+        {
+            "id": "list_date",
+            "name": "Phase A: 上市日期补全",
+            "desc": "core.stock.list_date 补全（补 P2-1）",
+        },
+        {
             "id": "shareholder",
             "name": "Phase C: 股东画像",
             "desc": "十大股东 + 股东户数 + 机构持股估算（质押率数据源未提供，暂无法展示）",
@@ -1074,6 +1108,9 @@ def api_trigger_task():
     手动触发采集任务（异步，启动后立即返回）。
     用后台线程运行，避免阻塞请求。
     """
+    auth_resp = _require_api_key()
+    if auth_resp:
+        return auth_resp
     data = request.get_json() or {}
     task_id = data.get("task_id", "")
 
@@ -1086,10 +1123,10 @@ def api_trigger_task():
             ).run_phase_a(),
         ),
         "phase_daily": (
-            "Phase B-日线行情",
+            "Phase B-日线行情（分块）",
             lambda: __import__(
-                "china_stocks.src.phase_b_daily", fromlist=["run_phase_daily"]
-            ).run_phase_daily(),
+                "china_stocks.src.phase_b_daily", fromlist=["run_phase_daily_batched"]
+            ).run_phase_daily_batched(),
         ),
         "stock_basic": (
             "Phase C-估值画像",
@@ -1108,6 +1145,18 @@ def api_trigger_task():
             lambda: __import__(
                 "china_stocks.biz.capital_snapshot", fromlist=["run_capital_snapshot"]
             ).run_capital_snapshot(),
+        ),
+        "financial_report": (
+            "Phase C-财务三大表绝对值",
+            lambda: __import__(
+                "china_stocks.biz.finance_snapshot", fromlist=["run_financial_report"]
+            ).run_financial_report(),
+        ),
+        "list_date": (
+            "Phase A-上市日期补全",
+            lambda: __import__(
+                "china_stocks.src.phase_a_stock_pool", fromlist=["update_list_date"]
+            ).update_list_date(),
         ),
         "shareholder": (
             "Phase C-股东画像",

@@ -76,7 +76,44 @@ def fetch_stock_list() -> pd.DataFrame:
             logger.warning(f"{source} 数据源获取股票列表失败: {e}")
             continue
 
-    raise RuntimeError(f"所有数据源都获取股票列表失败: {last_error}")
+    # 所有数据源都失败时，回落 raw.api_response 最近快照（降级可用）
+    logger.warning("所有数据源实时拉取均失败，尝试从 raw.api_response 快照降级")
+    try:
+        with get_session() as sess:
+            import json
+
+            row = sess.execute(
+                text("""
+                    SELECT response, fetched_at
+                    FROM raw.api_response
+                    WHERE api_name IN ('stock_zh_a_spot_em', 'stock_info_a_code_name')
+                    ORDER BY fetched_at DESC
+                    LIMIT 1
+                """),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("raw.api_response 中也无可用快照")
+
+            logger.warning(f"使用 raw 快照降级（时间: {row.fetched_at}）")
+            records = row.response  # JSONB 自动解析为 list[dict]
+            df = pd.DataFrame(records)
+
+            # 兼容多种列名
+            out = pd.DataFrame()
+            col_code = next((c for c in df.columns if c in ("代码", "code", "股票代码")), None)
+            col_name = next((c for c in df.columns if c in ("名称", "name", "股票名称")), None)
+            if not col_code or not col_name:
+                raise RuntimeError(f"raw 快照字段无法识别: {list(df.columns)[:10]}")
+            out["stock_code"] = df[col_code].astype(str).str.zfill(6)
+            out["stock_name"] = df[col_name].astype(str)
+            out["market"] = out["stock_code"].apply(_detect_market)
+            out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+            logger.info(f"raw 快照降级成功: {len(out)} 只")
+            return out
+    except Exception as snapshot_err:
+        raise RuntimeError(
+            f"所有数据源都获取股票列表失败: {last_error}，raw 快照降级也失败: {snapshot_err}"
+        )
 
 
 def save_stock_list_to_src(df: pd.DataFrame) -> int:
@@ -317,6 +354,71 @@ def get_stock_codes(limit: Optional[int] = None, only_watchlist: bool = False) -
     return codes
 
 
+def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 100) -> int:
+    """批量更新 core.stock.list_date（上市日期）。
+
+    使用 akshare 的 stock_individual_info_em 接口逐只拉取，
+    避免 stock_zh_a_spot_em 无 list_date 字段的问题。
+    返回更新行数。
+    """
+    if codes is None:
+        codes = get_stock_codes()
+
+    updated = 0
+    results: list[dict] = []
+    logger.info(f"开始更新上市日期: {len(codes)} 只股票")
+
+    for i, code in enumerate(codes, 1):
+        ld = ak.fetch_list_date(code)
+        if ld:
+            results.append({"stock_code": code, "list_date": ld})
+        if i % 100 == 0:
+            logger.info(f"上市日期进度: {i}/{len(codes)}, 已获取 {len(results)}")
+
+        if len(results) >= flush_every:
+            df = pd.DataFrame(results)
+            with get_session() as sess:
+                conn = sess.connection()
+                df.to_sql(
+                    "tmp_list_date", conn, schema="core",
+                    if_exists="replace", index=False, method="multi", chunksize=1000,
+                )
+                r = sess.execute(text("""
+                    UPDATE core.stock s
+                    SET list_date = CAST(t.list_date AS date),
+                        updated_at = NOW()
+                    FROM core.tmp_list_date t
+                    WHERE s.stock_code = t.stock_code
+                      AND s.list_date IS DISTINCT FROM CAST(t.list_date AS date)
+                """))
+                updated += r.rowcount
+                sess.execute(text("DROP TABLE IF EXISTS core.tmp_list_date"))
+            results = []
+
+    # 末尾剩余批次
+    if results:
+        df = pd.DataFrame(results)
+        with get_session() as sess:
+            conn = sess.connection()
+            df.to_sql(
+                "tmp_list_date", conn, schema="core",
+                if_exists="replace", index=False, method="multi", chunksize=1000,
+            )
+            r = sess.execute(text("""
+                UPDATE core.stock s
+                SET list_date = CAST(t.list_date AS date),
+                    updated_at = NOW()
+                FROM core.tmp_list_date t
+                WHERE s.stock_code = t.stock_code
+                  AND s.list_date IS DISTINCT FROM CAST(t.list_date AS date)
+            """))
+            updated += r.rowcount
+            sess.execute(text("DROP TABLE IF EXISTS core.tmp_list_date"))
+
+    logger.info(f"上市日期更新完成: {updated} 只")
+    return updated
+
+
 def run_phase_a() -> None:
     """完整执行 Phase A。"""
     run = start_run(platform_code="akshare", phase="phase_a", target="all")
@@ -336,6 +438,13 @@ def run_phase_a() -> None:
 
         # 3. 刷新 core.stock
         inserted, updated = refresh_core_stock()
+
+        # 4. 更新上市日期（P2-1 修复，失败不影响主流程）
+        try:
+            list_date_count = update_list_date(codes=get_stock_codes())
+            logger.info(f"上市日期更新: {list_date_count} 只")
+        except Exception as e:
+            logger.warning(f"上市日期更新失败（将跳过）: {e}")
 
         # 三态判定：Phase A 是源头，写入行数为 0 说明异常
         total_rows = inserted + list_count + sw_count

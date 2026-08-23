@@ -165,7 +165,7 @@ def _get_finance_session() -> requests.Session:
     return _finance_session
 
 
-def fetch_finance_indicator(symbol: str, start_year: str = "1900") -> pd.DataFrame:
+def fetch_finance_indicator(symbol: str, start_year: str = "1900", save_raw: bool = True) -> pd.DataFrame:
     """新浪财经-财务分析-财务指标（自研，共享 Session + 退避重试）。
 
     等价于 akshare.stock_financial_analysis_indicator，但复用同一个
@@ -247,10 +247,22 @@ def fetch_finance_indicator(symbol: str, start_year: str = "1900") -> pd.DataFra
     out_df["日期"] = pd.to_datetime(out_df["日期"], errors="coerce").dt.date
     for item in out_df.columns[1:]:
         out_df[item] = pd.to_numeric(out_df[item], errors="coerce")
+
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="sina",
+                api_name="stock_financial_analysis_indicator",
+                params={"symbol": symbol, "start_year": start_year},
+                response=out_df.to_dict(orient="records"),
+            )
+        except Exception as e:
+            logger.warning(f"保存财务指标 raw 响应失败: {e}")
+
     return out_df
 
 
-def fetch_main_stock_holder(symbol: str) -> pd.DataFrame:
+def fetch_main_stock_holder(symbol: str, save_raw: bool = True) -> pd.DataFrame:
     """新浪财经-股本股东-主要股东（自研，共享 Session + 退避重试）。
 
     等价于 akshare.stock_main_stock_holder，但复用同一个 requests.Session。
@@ -321,6 +333,18 @@ def fetch_main_stock_holder(symbol: str) -> pd.DataFrame:
     big_df["公告日期"] = pd.to_datetime(big_df["公告日期"], errors="coerce").dt.date
     big_df["股东总数"] = pd.to_numeric(big_df["股东总数"], errors="coerce")
     big_df["平均持股数"] = pd.to_numeric(big_df["平均持股数"], errors="coerce")
+
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="sina",
+                api_name="stock_main_stock_holder",
+                params={"symbol": symbol},
+                response=big_df.to_dict(orient="records"),
+            )
+        except Exception as e:
+            logger.warning(f"保存主要股东 raw 响应失败: {e}")
+
     return big_df
 
 
@@ -507,6 +531,12 @@ def fetch_research_reports_by_date(
             })
         if len(lst) < 100:
             break
+        if page + 1 >= 100:
+            logger.warning(
+                f"研报拉取 date={trade_date} 已达分页上限 100 页，"
+                f"单日研报可能超过上限被截断，请关注"
+            )
+            break
         page += 1
         time.sleep(0.3)
 
@@ -527,7 +557,7 @@ def fetch_research_reports_by_date(
 
 def fetch_survey_stat_by_date(
     trade_date: str,
-    save_raw: bool = False,
+    save_raw: bool = True,
 ) -> pd.DataFrame:
     """东财机构调研统计（自研直连，替代 akshare.stock_jgdy_tj_em）。
 
@@ -600,3 +630,101 @@ def fetch_survey_stat_by_date(
             logger.warning(f"保存调研 raw 响应失败: {e}")
     logger.info(f"{trade_date} 调研拉取: {len(df)} 条")
     return df
+
+
+# ============================================================
+# 财务三大表绝对值（营收 / 净利润）
+# ============================================================
+
+
+def fetch_financial_report(
+    symbol: str,
+    save_raw: bool = True,
+) -> pd.DataFrame:
+    """东财三大报表-利润表摘要（自研直连，替代已移除的 stock_financial_abstract）。
+
+    返回列：股票代码 / 报告期 / 营业收入 / 营业利润 / 利润总额 / 净利润 / 归母净利润
+    用于填充 biz.finance_snapshot 的 revenue 和 net_profit 字段。
+    """
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    params = {
+        "sortColumns": "REPORT_DATE",
+        "sortTypes": "-1",
+        "pageSize": "10",
+        "pageNumber": "1",
+        "reportName": "RPT_DMSK_FN_ABSTRACT",
+        "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,REPORT_DATE,OPERATE_INCOME,TOTAL_OPERATE_INCOME,OPERATE_PROFIT,TOTAL_PROFIT,NET_PROFIT,NET_PROFIT_ATSOPC",
+        "source": "WEB",
+        "client": "WEB",
+        "filter": f'(SECURITY_CODE="{symbol}")',
+    }
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": BROWSER_UA})
+
+    try:
+        j = _em_get_json(sess, url, params)
+        lst = (j.get("result") or {}).get("data") or []
+        if not lst:
+            return pd.DataFrame()
+
+        rows = []
+        for rec in lst:
+            rows.append({
+                "股票代码": str(rec.get("SECURITY_CODE", "")).strip(),
+                "报告期": str(rec.get("REPORT_DATE", ""))[:10],
+                "营业收入": rec.get("OPERATE_INCOME"),
+                "营业总收入": rec.get("TOTAL_OPERATE_INCOME"),
+                "营业利润": rec.get("OPERATE_PROFIT"),
+                "利润总额": rec.get("TOTAL_PROFIT"),
+                "净利润": rec.get("NET_PROFIT"),
+                "归母净利润": rec.get("NET_PROFIT_ATSOPC"),
+            })
+
+        df = pd.DataFrame(rows)
+        logger.info(f"{symbol} 财务三大表拉取: {len(df)} 条报告期")
+
+        if save_raw:
+            try:
+                save_raw_response(
+                    platform_code="eastmoney",
+                    api_name="stock_financial_report_abstract",
+                    params={"symbol": symbol},
+                    response=df.to_dict(orient="records"),
+                )
+            except Exception as e:
+                logger.warning(f"保存财务三大表 raw 响应失败: {e}")
+
+        return df
+    except Exception as e:
+        logger.warning(f"{symbol} 财务三大表拉取失败: {e}")
+        return pd.DataFrame()
+
+
+# ============================================================
+# P2-1 修复：股票上市日期
+# ============================================================
+
+
+def fetch_list_date(symbol: str) -> str | None:
+    """获取单只股票的上市日期（东财个股信息接口）。
+
+    使用 akshare 的 stock_individual_info_em，返回如 '20010827' 格式。
+    """
+    try:
+        df = call_api(
+            "stock_individual_info_em",
+            save_raw=False,
+            symbol=symbol,
+        )
+        if df.empty:
+            return None
+        # 接口返回两列：item / value，找 item='上市日期'
+        row = df[df["item"] == "上市日期"]
+        if row.empty:
+            return None
+        val = str(row.iloc[0]["value"]).strip()
+        if val and val != "nan":
+            return val
+    except Exception as e:
+        logger.debug(f"{symbol} 上市日期拉取失败: {e}")
+    return None

@@ -24,6 +24,7 @@ from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
 from ..src import akshare_client as ak
 from ..src.phase_a_stock_pool import get_stock_codes
+from .stock_basic import _last_trading_day
 
 
 # ============================================================
@@ -42,7 +43,7 @@ def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
         try:
             df = ak.call_api(
                 "stock_hsgt_hold_stock_em",
-                save_raw=False,
+                save_raw=True,
                 market=market,
                 indicator="今日排行",
             )
@@ -94,7 +95,7 @@ def _fetch_margin_latest(api_name: str, label: str, lookback: int = 10) -> pd.Da
     for back in range(1, lookback + 1):
         d = (date.today() - timedelta(days=back)).strftime("%Y%m%d")
         try:
-            df = ak.call_api(api_name, save_raw=False, date=d)
+            df = ak.call_api(api_name, save_raw=True, date=d)
         except Exception as e:
             logger.debug(f"{label}两融 {d} 拉取失败: {e}")
             continue
@@ -115,7 +116,7 @@ def save_capital_snapshot(north_df: pd.DataFrame, as_of: Optional[date] = None) 
         return 0
 
     if as_of is None:
-        as_of = date.today()
+        as_of = _last_trading_day()
 
     df = north_df.copy()
     df["as_of_date"] = as_of
@@ -184,7 +185,7 @@ def fetch_and_save_margin() -> int:
         return 0
 
     df = pd.concat(records, ignore_index=True).drop_duplicates(subset=["stock_code"])
-    df["as_of_date"] = date.today()
+    df["as_of_date"] = _last_trading_day()
 
     with get_session() as sess:
         conn = sess.connection()

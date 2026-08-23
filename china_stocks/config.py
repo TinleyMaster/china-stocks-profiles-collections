@@ -24,6 +24,12 @@ def _get_env(name: str, default: str | None = None) -> str:
 # 优先使用 DATABASE_URL（Zeabur/Heroku 等平台的标准整串 URL）
 # 如果没有，再用 DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD 拼装
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL and not os.getenv("DB_HOST"):
+    raise RuntimeError(
+        "必须设置 DATABASE_URL 或 DB_HOST 环境变量。"
+        "生产环境请设置 DATABASE_URL（完整连接串），"
+        "本地开发可设置 DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD。"
+    )
 DB_HOST = _get_env("DB_HOST", "localhost")
 DB_PORT = int(_get_env("DB_PORT", "5432"))
 DB_NAME = _get_env("DB_NAME", "china_stocks")

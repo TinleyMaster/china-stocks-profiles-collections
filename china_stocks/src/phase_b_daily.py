@@ -336,5 +336,51 @@ def run_phase_daily(
         raise
 
 
+def run_phase_daily_batched(
+    stock_codes: Optional[list[str]] = None,
+    incremental: bool = True,
+) -> None:
+    """按代码前缀分块执行日线行情采集，避免单 run 超时墙截断。
+
+    按前缀切 5 批，每批独立 run（独立的 ingest_run 记录），
+    即使某批超时也不影响其他批次的完成。
+    """
+    if stock_codes is None:
+        stock_codes = get_stock_codes()
+
+    # 前缀分组
+    prefix_groups: dict[str, list[str]] = {}
+    for code in stock_codes:
+        p = code[0] if code else "?"
+        prefix_groups.setdefault(p, []).append(code)
+
+    # 按前缀范围合并为 5 批
+    batches: list[tuple[str, list[str]]] = []
+    batch_ranges = [
+        ("0", {"0"}),           # 深市主板
+        ("3", {"3"}),           # 创业板
+        ("6", {"6"}),           # 沪市主板
+        ("8-9", {"8", "9"}),    # 北交所
+        ("other", {"2", "4", "5", "7", "?"}),  # 其他
+    ]
+    for label, prefixes in batch_ranges:
+        codes = []
+        for p in prefixes:
+            codes.extend(prefix_groups.get(p, []))
+        if codes:
+            batches.append((label, codes))
+
+    total_rows = 0
+    for label, codes in batches:
+        logger.info(f"日线分块采集: 前缀 {label} ({len(codes)} 只)")
+        try:
+            run_phase_daily(stock_codes=codes, incremental=incremental)
+        except Exception as e:
+            logger.warning(f"日线分块采集 前缀 {label} 失败: {e}")
+            # 继续下一批，不中断
+
+    logger.info("日线分块采集全部完成")
+
+
 if __name__ == "__main__":
-    run_phase_daily()
+    run_phase_daily_batched()
