@@ -361,6 +361,15 @@ def cmd_parse_docs(args) -> None:
         raise
 
 
+def cmd_embed_docs(args) -> None:
+    """为 doc_chunk 中尚无 embedding 的块生成向量。"""
+    from .biz.doc_parser import embed_pending_chunks
+
+    batch_size = args.batch_size or 200
+    count = embed_pending_chunks(batch_size=batch_size)
+    print(f"向量 embedding 生成完成: {count} 块")
+
+
 def cmd_seed_demo(_args) -> None:
     from .seed_demo import run_seed_demo
 
@@ -547,6 +556,11 @@ def main() -> None:
     )
     p_parse.add_argument("--stats", action="store_true", help="查看切块统计信息")
 
+    p_embed = sub.add_parser(
+        "embed-docs", help="为文档切块生成向量 embedding（pgvector+LLM 可用时）"
+    )
+    p_embed.add_argument("--batch-size", type=int, help="每批处理数量（默认 200）")
+
     sub.add_parser("seed-demo", help="填充 demo 示例数据（本地演示/调试用）")
     sub.add_parser("web", help="启动 Web 工作台（独立运行，无调度器）")
 
@@ -577,6 +591,7 @@ def main() -> None:
         "notebook-fill": cmd_notebook_fill,
         "ask": cmd_ask,
         "parse-docs": cmd_parse_docs,
+        "embed-docs": cmd_embed_docs,
         "seed-demo": cmd_seed_demo,
         "web": cmd_web,
     }

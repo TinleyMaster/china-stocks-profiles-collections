@@ -188,6 +188,27 @@ def get_pending_downloads(
     ]
 
 
+def _resolve_pdf_url(url: str, source_platform: str, pub_date) -> str:
+    """将详情页 URL 转换为真实 PDF 下载链接。
+
+    巨潮资讯的公告链接通常是详情页 HTML，需要转换为 static.cninfo.com.cn 的 PDF 直链。
+    """
+    if source_platform == "cninfo" and "cninfo.com.cn" in url:
+        # 尝试从 URL 中提取 announcementId 和 announcementTime
+        import re as _re
+        m_id = _re.search(r"announcementId=([^&]+)", url)
+        m_time = _re.search(r"announcementTime=([^&]+)", url)
+        if m_id and m_time:
+            ann_id = m_id.group(1)
+            ann_time = m_time.group(1)
+            # 巨潮 PDF 直链格式
+            return f"https://static.cninfo.com.cn/finalpage/{ann_time}/{ann_id}.PDF"
+        # 如果已经是 static 域名的 PDF，直接返回
+        if "static.cninfo.com.cn" in url and url.lower().endswith(".pdf"):
+            return url
+    return url
+
+
 def _download_one(item: dict) -> tuple[int, bool, str]:
     """
     下载单条文档。
@@ -202,6 +223,9 @@ def _download_one(item: dict) -> tuple[int, bool, str]:
     source_platform = item.get("source_platform", "cninfo")
 
     try:
+        # 将详情页 URL 解析为真实 PDF 链接
+        url = _resolve_pdf_url(url, source_platform, pub_date)
+
         year = pub_date.year if pub_date else 2000
         filename = _sanitize_filename(f"{pub_date}_{title}" if pub_date else title)
         save_path = _get_download_dir(stock_code, doc_type, year) / filename

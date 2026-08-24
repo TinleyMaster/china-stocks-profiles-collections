@@ -11,7 +11,7 @@ Phase A：构建股票统一实体
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Optional
 
 import pandas as pd
@@ -533,12 +533,31 @@ def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 200) 
             return code, None
 
     workers = min(MAX_WORKERS, 10)
+    overall_timeout = 20 * 60  # 整体 20 分钟超时，防卡死
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_fetch_one, c): c for c in codes}
         done = 0
+        import time
+        start_ts = time.time()
         for fut in as_completed(futures):
+            # 整体超时保护
+            if time.time() - start_ts > overall_timeout:
+                logger.warning(
+                    f"上市日期采集整体超时（>{overall_timeout//60}min），"
+                    f"已完成 {done}/{len(codes)}，放弃剩余"
+                )
+                # 取消未完成的 future
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
+                break
             done += 1
-            code, ld = fut.result()
+            try:
+                code, ld = fut.result(timeout=30)
+            except FuturesTimeoutError:
+                continue
+            except Exception:
+                continue
             if ld:
                 results.append({"stock_code": code, "list_date": ld})
 
@@ -624,7 +643,13 @@ def update_industry_l2(flush_every: int = 100) -> int:
 
 def run_phase_a() -> None:
     """完整执行 Phase A。"""
-    run = start_run(platform_code="akshare", phase="phase_a", target="all")
+    # Phase A 历史耗时 16~28 秒，30 分钟超时足够（防卡死）
+    run = start_run(
+        platform_code="akshare",
+        phase="phase_a",
+        target="all",
+        timeout_minutes=30,
+    )
     try:
         # 1. 股票列表
         list_df = fetch_stock_list()

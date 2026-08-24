@@ -26,15 +26,22 @@ VALID_STATUSES = {"running", "success", "failed", "skipped", "warning"}
 DEFAULT_TIMEOUT_MINUTES = 120
 
 
-def start_run(platform_code: str, phase: str, target: str | None = None) -> IngestRun:
+def start_run(
+    platform_code: str,
+    phase: str,
+    target: str | None = None,
+    timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
+) -> IngestRun:
     """启动一次采集任务，返回 run 对象。
 
     启动前会先回收同 phase 的僵尸 running 任务（超时熔断），
     然后检查是否已有同 phase 的 running 任务（防并发重入），
     如有则直接 skipped 返回。
+
+    timeout_minutes: 本任务单独的超时阈值，用于 reap_stale_runs 回收判断。
     """
-    # 先回收同 phase 的僵尸任务
-    reap_stale_runs(phase=phase)
+    # 先回收同 phase 的僵尸任务（使用本次任务的超时阈值）
+    reap_stale_runs(phase=phase, timeout_minutes=timeout_minutes)
 
     with get_session() as sess:
         # 检查是否已有同 phase 的 running 任务（防并发重入）
