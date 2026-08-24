@@ -5,11 +5,11 @@ A 股投研核心维度之一，覆盖：
   1. 十大股东（每季度更新，来自定期报告）
   2. 股东人数（反映筹码集中度）
   3. 机构持仓占比（根据前十大股东名称估算）
+  4. 质押比例（东财全市场批量接口，秒级完成）
 
-数据来源：新浪财经-主要股东（stock_main_stock_holder）。
-  注：原东财接口（十大股东/质押/股东户数）已全线失效，改用新浪单接口，
-  一次请求同时拿到十大股东 + 股东总数 + 平均持股数。股权质押暂无可用免费源，
-  置空跳过。
+数据来源：
+  - 十大股东/股东人数：新浪财经-主要股东（stock_main_stock_holder）
+  - 质押比例：东财数据中心全市场质押排名（批量拉取，替代逐只采集）
 """
 from __future__ import annotations
 
@@ -51,7 +51,10 @@ def _estimate_inst_hold_pct(holders: list[dict]) -> Optional[float]:
 
 
 def _fetch_profile(code: str) -> Optional[dict]:
-    """拉取单只股票主要股东，解析最新一期画像（十大股东 + 股东总数）。"""
+    """拉取单只股票主要股东，解析最新一期画像（十大股东 + 股东总数）。
+
+    注意：质押比例不再逐只拉取，改为全市场批量拉取后在 flush 时合并。
+    """
     try:
         df = ak.fetch_main_stock_holder(symbol=code)
     except Exception as e:
@@ -99,8 +102,32 @@ def _fetch_profile(code: str) -> Optional[dict]:
         "holders": holders,
         "shareholder_count": shareholder_count,
         "inst_hold_pct": _estimate_inst_hold_pct(holders),
-        "pledge_pct": ak.fetch_pledge_pct(symbol=code),
+        # pledge_pct 在 _flush_shareholders 中从全市场批量数据合并
+        "pledge_pct": None,
     }
+
+
+def _load_pledge_map() -> dict[str, float]:
+    """全市场批量拉取质押比例，返回 {stock_code: pledge_pct} 映射。
+
+    优先用东财全市场批量接口（秒级），失败则返回空 dict（不阻塞主流程）。
+    """
+    try:
+        df = ak.fetch_all_pledge_pct(save_raw=True)
+        if df.empty:
+            logger.warning("全市场质押比例拉取为空，质押率字段将不更新")
+            return {}
+        pledge_map: dict[str, float] = {}
+        for _, row in df.iterrows():
+            code = str(row["stock_code"]).zfill(6)
+            val = row.get("pledge_pct")
+            if val is not None and pd.notna(val):
+                pledge_map[code] = float(val)
+        logger.info(f"质押比例批量加载完成: {len(pledge_map)} 只有数据")
+        return pledge_map
+    except Exception as e:
+        logger.warning(f"全市场质押比例拉取失败（将跳过质押率更新）: {e}")
+        return {}
 
 
 def fetch_and_save_shareholders(
@@ -110,12 +137,18 @@ def fetch_and_save_shareholders(
 ) -> tuple[int, int]:
     """批量采集股东画像。串行拉取（新浪源），增量落盘。
 
+    质押比例通过东财全市场批量接口一次性拉取，在 flush 时合并，
+    避免逐只调用导致 5500 次额外请求。
+
     flush_every：每累积这么多只就先 upsert 一次，避免一次性写入失败导致整批丢失。
     """
     if codes is None:
         codes = get_stock_codes()
     if limit and limit > 0:
         codes = codes[:limit]
+
+    # 先批量拉取全市场质押比例（秒级完成，失败不阻塞主流程）
+    pledge_map = _load_pledge_map()
 
     results: list[dict] = []
     total_saved = 0
@@ -125,6 +158,9 @@ def fetch_and_save_shareholders(
     for i, code in enumerate(codes, 1):
         profile = _fetch_profile(code)
         if profile:
+            # 合并质押比例（批量拉取的数据优先）
+            if code in pledge_map:
+                profile["pledge_pct"] = pledge_map[code]
             results.append(profile)
         else:
             total_failed += 1

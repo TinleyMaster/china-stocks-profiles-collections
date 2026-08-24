@@ -641,20 +641,21 @@ def api_stock_detail(code):
 def api_stock_kline(code):
     """
     获取股票日线K线数据。
-    支持 ?period=  参数：
+    支持参数：
       - period: 天数，默认 120 天，范围 1~1000
+      - limit: period 的别名（兼容习惯用法）
     返回 ECharts 友好格式：[[日期, 开, 收, 低, 高, 成交量, ...], ...]
     """
     code = code.zfill(6)
 
-    # 参数校验
-    period_raw = request.args.get("period", "120")
+    # 参数校验：limit 作为 period 的别名
+    period_raw = request.args.get("period") or request.args.get("limit") or "120"
     try:
         period = int(period_raw)
     except (ValueError, TypeError):
-        return jsonify({"error": f"period 参数必须是整数，收到: {period_raw!r}"}), 400
+        return jsonify({"error": f"period/limit 参数必须是整数，收到: {period_raw!r}"}), 400
     if period < 1 or period > 1000:
-        return jsonify({"error": f"period 参数范围必须在 1~1000 之间，收到: {period}"}), 400
+        return jsonify({"error": f"period/limit 参数范围必须在 1~1000 之间，收到: {period}"}), 400
 
     with get_session() as sess:
         rows = sess.execute(
@@ -769,6 +770,54 @@ def api_stock_shareholders(code):
             "updated_at": str(row.updated_at) if row.updated_at else None,
         }
     )
+
+
+@app.route("/api/stock/<code>/events")
+def api_stock_events(code):
+    """公司事件列表（分红/解禁/回购/业绩预告/增减持）。
+
+    参数:
+      - event_type: 可选，过滤事件类型（逗号分隔）
+      - limit: 可选，默认 50，最大 200
+    """
+    code = code.zfill(6)
+
+    event_type = request.args.get("event_type", "").strip()
+    limit_raw = request.args.get("limit", "50")
+    try:
+        limit = min(int(limit_raw), 200)
+    except (ValueError, TypeError):
+        limit = 50
+
+    sql = """
+        SELECT id, event_type, event_date, event_data, fetched_at
+        FROM biz.corporate_event
+        WHERE stock_code = :code
+    """
+    params: dict = {"code": code, "limit": limit}
+
+    if event_type:
+        types = [t.strip() for t in event_type.split(",") if t.strip()]
+        if types:
+            sql += " AND event_type = ANY(:types)"
+            params["types"] = types
+
+    sql += " ORDER BY event_date DESC LIMIT :limit"
+
+    with get_session() as sess:
+        rows = sess.execute(text(sql), params).fetchall()
+
+    events = []
+    for r in rows:
+        events.append({
+            "id": r.id,
+            "event_type": r.event_type,
+            "event_date": str(r.event_date) if r.event_date else None,
+            "event_data": r.event_data,
+            "fetched_at": str(r.fetched_at) if r.fetched_at else None,
+        })
+
+    return jsonify({"stock_code": code, "events": events, "count": len(events)})
 
 
 def _calc_ma(values: list[float], period: int) -> list[Optional[float]]:
@@ -886,6 +935,7 @@ def api_ask():
     auth_resp = _require_api_key()
     if auth_resp:
         return auth_resp
+    from .biz.llm_client import get_provider_info
     from .biz.rag import ask_stock
 
     data = request.get_json() or {}
@@ -897,10 +947,20 @@ def api_ask():
 
     try:
         result = ask_stock(code, question, save_to_history=True)
+        # 附带 LLM 配置状态，前端可明确展示 mock / 真实模式
+        result["llm_info"] = get_provider_info()
         return jsonify(result)
     except Exception as e:
         logger.exception(f"RAG 问答失败: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/llm/status")
+def api_llm_status():
+    """LLM 配置状态（供前端判断是否为 mock 模式）。"""
+    from .biz.llm_client import get_provider_info
+
+    return jsonify(get_provider_info())
 
 
 @app.route("/api/chat/<code>")
@@ -2089,9 +2149,11 @@ function renderAsk(params = {}) {
   const content = document.getElementById('page-content');
 
   content.innerHTML = `
-    <h2 class="text-2xl font-bold mb-6">智能问答</h2>
+    <h2 class="text-2xl font-bold mb-4">智能问答</h2>
 
-    <div class="grid grid-cols-[280px_1fr] gap-6 h-[calc(100vh-120px)]">
+    <div id="llm-status-bar" class="mb-4 px-4 py-2 rounded text-sm hidden"></div>
+
+    <div class="grid grid-cols-[280px_1fr] gap-6 h-[calc(100vh-160px)]">
       <!-- 左侧：股票选择 + 历史 -->
       <div class="card p-4 flex flex-col">
         <div class="mb-4">
@@ -2129,6 +2191,9 @@ function renderAsk(params = {}) {
 
   if (code) loadChatHistory(code);
 
+  // 加载 LLM 状态，展示 mock / 真实模式提示
+  loadLlmStatus();
+
   // 回车发送（Ctrl+Enter 换行）
   const textarea = document.getElementById('ask-input');
   textarea.addEventListener('keydown', (e) => {
@@ -2137,6 +2202,30 @@ function renderAsk(params = {}) {
       sendQuestion();
     }
   });
+}
+
+async function loadLlmStatus() {
+  try {
+    const info = await api('/api/llm/status');
+    updateLlmStatusBar(info);
+  } catch (e) {
+    // 静默失败，不影响主流程
+  }
+}
+
+function updateLlmStatusBar(info) {
+  const bar = document.getElementById('llm-status-bar');
+  if (!bar || !info) return;
+  bar.classList.remove('hidden');
+  if (info.available) {
+    bar.className = 'mb-4 px-4 py-2 rounded text-sm bg-green-50 text-green-700 border border-green-200';
+    bar.innerHTML = `✅ 已接入 LLM 模型：<strong>${info.model}</strong>（${info.provider}）`
+      + (info.has_embedding ? ' · 支持向量检索' : '');
+  } else {
+    bar.className = 'mb-4 px-4 py-2 rounded text-sm bg-amber-50 text-amber-700 border border-amber-200';
+    bar.innerHTML = '⚠️ <strong>Mock 模式</strong>：未配置真实 LLM，回答为占位模板，'
+      + '请在 .env 中设置 <code>LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL / LLM_MODEL</code> 后启用。';
+  }
 }
 
 async function loadChatHistory(code) {
@@ -2183,6 +2272,8 @@ async function sendQuestion() {
       appendMessage('assistant', `❌ 错误: ${resp.error}`);
     } else {
       appendMessage('assistant', resp.answer, resp.sources);
+      // 每次回答后更新 LLM 状态（mock / 真实模式）
+      if (resp.llm_info) updateLlmStatusBar(resp.llm_info);
     }
   } catch (e) {
     removeLoading(loadingId);

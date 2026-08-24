@@ -19,7 +19,103 @@ from sqlalchemy import text
 
 from ..db import get_session
 from ..logging_setup import logger
-from .llm_client import chat_completion, is_available
+from .llm_client import chat_completion, is_available, embed as llm_embed
+
+# 缓存：pgvector 是否可用（避免每次查询都查系统表）
+_pgvector_available: Optional[bool] = None
+
+
+def _pgvector_available_cached() -> bool:
+    """检查 pgvector 扩展是否已安装（带缓存）。"""
+    global _pgvector_available
+    if _pgvector_available is not None:
+        return _pgvector_available
+    try:
+        with get_session() as sess:
+            row = sess.execute(text(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+            )).fetchone()
+            _pgvector_available = row is not None
+    except Exception as e:
+        logger.warning(f"检查 pgvector 可用性失败: {e}")
+        _pgvector_available = False
+    return _pgvector_available
+
+
+def vector_search_chunks(
+    stock_code: str,
+    query: str,
+    doc_types: Optional[list[str]] = None,
+    limit: int = 20,
+) -> list[RetrievedDoc]:
+    """
+    向量相似度检索（pgvector + embedding 可用时启用）。
+
+    返回格式与 keyword_search_chunks 一致，score 为相似度（0~1，越高越相关）。
+    不可用时返回空列表。
+    """
+    if not _pgvector_available_cached():
+        return []
+    if not is_available():  # 真实 LLM 可用才能 embedding
+        return []
+
+    # 生成查询向量
+    embeddings = llm_embed([query])
+    if not embeddings or not embeddings[0]:
+        return []
+
+    query_vec = embeddings[0]
+    # pgvector 余弦相似度：1 - (embedding <=> query_vec)
+    # 向量以 list 形式传入，psycopg2 会自动适配
+    vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
+
+    sql = """
+        SELECT c.id AS chunk_id, c.doc_id, c.chunk_index, c.chunk_text, c.chunk_tokens,
+               d.title, d.source_platform, d.doc_type, d.publish_date, d.url,
+               1 - (c.embedding <=> :vec::vector) AS similarity
+        FROM biz.doc_chunk c
+        JOIN biz.doc_source_entry d ON d.id = c.doc_id
+        WHERE c.stock_code = :code
+          AND c.embedding IS NOT NULL
+    """
+    params: dict = {"code": stock_code, "vec": vec_str, "limit": limit}
+
+    if doc_types:
+        sql += " AND d.doc_type = ANY(:dtypes)"
+        params["dtypes"] = doc_types
+
+    sql += " ORDER BY c.embedding <=> :vec::vector LIMIT :limit"
+
+    try:
+        with get_session() as sess:
+            rows = sess.execute(text(sql), params).fetchall()
+    except Exception as e:
+        logger.warning(f"向量检索失败: {e}")
+        return []
+
+    if not rows:
+        return []
+
+    results = []
+    for r in rows:
+        sim = float(r.similarity) if r.similarity is not None else 0.0
+        # 余弦相似度范围 [-1, 1]，归一化到 [0, 1]
+        score = max(0.0, min(1.0, (sim + 1) / 2))
+        results.append(
+            RetrievedDoc(
+                doc_id=r.doc_id,
+                title=r.title,
+                source_platform=r.source_platform,
+                doc_type=r.doc_type,
+                publish_date=str(r.publish_date) if r.publish_date else None,
+                url=r.url or "",
+                snippet=_make_snippet(r.chunk_text, []),
+                score=score,
+                chunk_id=r.chunk_id,
+                chunk_index=r.chunk_index,
+            )
+        )
+    return results
 
 
 @dataclass
@@ -378,22 +474,27 @@ def hybrid_search(
     query: str,
     doc_types: Optional[list[str]] = None,
     limit: int = 15,
-    title_weight: float = 0.3,
-    chunk_weight: float = 0.7,
+    title_weight: float = 0.2,
+    keyword_weight: float = 0.4,
+    vector_weight: float = 0.4,
 ) -> list[RetrievedDoc]:
     """
-    混合检索：标题 + 正文块双路召回，融合后排序。
+    混合检索：标题 + 关键词正文 + 向量语义 三路召回，融合后排序。
 
     策略：
-      - 标题召回权重较低（0.3），但标题命中代表主题相关
-      - 正文块召回权重较高（0.7），内容更具体
+      - 标题召回（0.2）：主题相关度高
+      - 关键词正文召回（0.4）：精确匹配，内容具体
+      - 向量语义召回（0.4）：语义相似，pgvector+embedding 可用时启用
       - 同一 doc_id 的结果合并，取较高得分
     """
-    # 两路召回
+    # 三路召回
     title_results = keyword_search_docs(
         stock_code, query, doc_types=doc_types, limit=limit
     )
-    chunk_results = keyword_search_chunks(
+    keyword_results = keyword_search_chunks(
+        stock_code, query, doc_types=doc_types, limit=limit
+    )
+    vector_results = vector_search_chunks(
         stock_code, query, doc_types=doc_types, limit=limit
     )
 
@@ -404,16 +505,23 @@ def hybrid_search(
         doc.score = doc.score * title_weight
         merged[doc.doc_id] = doc
 
-    for doc in chunk_results:
-        weighted_score = doc.score * chunk_weight
+    for doc in keyword_results:
+        weighted_score = doc.score * keyword_weight
         if doc.doc_id in merged:
-            # 正文块得分更高，用正文块替换（信息更丰富）
             if weighted_score > merged[doc.doc_id].score:
-                doc.score = weighted_score + merged[doc.doc_id].score * 0.2  # 标题加分
+                doc.score = weighted_score + merged[doc.doc_id].score * 0.2
                 merged[doc.doc_id] = doc
             else:
-                # 保留标题级，但加上正文命中的加分
                 merged[doc.doc_id].score += weighted_score * 0.3
+        else:
+            doc.score = weighted_score
+            merged[doc.doc_id] = doc
+
+    for doc in vector_results:
+        weighted_score = doc.score * vector_weight
+        if doc.doc_id in merged:
+            # 向量 + 关键词同时命中，加分（多模态命中更可信）
+            merged[doc.doc_id].score += weighted_score * 0.5
         else:
             doc.score = weighted_score
             merged[doc.doc_id] = doc

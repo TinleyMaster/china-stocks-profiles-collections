@@ -35,8 +35,11 @@ def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
     """
     获取北向资金最新持股明细（沪股通 + 深股通合并）。
 
-    akshare 接口 stock_hsgt_hold_stock_em 按市场分开，这里合并。
+    主源：akshare 接口 stock_hsgt_hold_stock_em（按市场分开，这里合并）
+    备用源：东财数据中心自研直连 fetch_north_holdings_em（2024-08 港交所停止
+           实时披露后，akshare 接口可能返回空，此时自动降级到备用源）
     """
+    # ── 主源：akshare 沪深港通持股 ──
     all_dfs = []
 
     for market in ["沪股通", "深股通"]:
@@ -54,32 +57,47 @@ def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
         except Exception as e:
             logger.warning(f"{market} 持股获取失败: {e}")
 
-    if not all_dfs:
+    if all_dfs:
+        df = pd.concat(all_dfs, ignore_index=True)
+
+        # 列名映射
+        col_map = _find_columns(df.columns.tolist(), {
+            "code": ["代码", "股票代码"],
+            "name": ["名称", "股票名称"],
+            "hold_shares": ["持股数量", "持股数", "数量"],
+            "hold_pct": ["持股占流通股比", "持股比例", "占比", "占流通股比例"],
+            "hold_amount": ["持股市值", "市值"],
+            "change_pct": ["持股变动"],
+        })
+
+        if col_map.get("code"):
+            out = pd.DataFrame()
+            out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6)
+            out["north_hold_shares"] = _to_numeric(df, col_map.get("hold_shares"))
+            out["north_hold_pct"] = _to_numeric(df, col_map.get("hold_pct"))
+            out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+            logger.info(f"北向持股汇总（akshare 源）: {len(out)} 只股票")
+            return out
+        logger.warning("北向持股返回字段异常，找不到股票代码列")
+
+    # ── 备用源：东财数据中心自研直连 ──
+    logger.info("akshare 北向持股无数据，尝试东财数据中心备用源")
+    try:
+        df_em = ak.fetch_north_holdings_em(save_raw=True)
+    except Exception as e:
+        logger.warning(f"东财直连北向持股拉取失败: {e}")
         return pd.DataFrame()
 
-    df = pd.concat(all_dfs, ignore_index=True)
-
-    # 列名映射
-    col_map = _find_columns(df.columns.tolist(), {
-        "code": ["代码", "股票代码"],
-        "name": ["名称", "股票名称"],
-        "hold_shares": ["持股数量", "持股数", "数量"],
-        "hold_pct": ["持股占流通股比", "持股比例", "占比", "占流通股比例"],
-        "hold_amount": ["持股市值", "市值"],
-        "change_pct": ["持股变动"],
-    })
-
-    if not col_map.get("code"):
-        logger.warning("北向持股返回字段异常，找不到股票代码列")
+    if df_em.empty:
+        logger.warning("东财直连北向持股也无数据")
         return pd.DataFrame()
 
     out = pd.DataFrame()
-    out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6)
-    out["north_hold_shares"] = _to_numeric(df, col_map.get("hold_shares"))
-    out["north_hold_pct"] = _to_numeric(df, col_map.get("hold_pct"))
+    out["stock_code"] = df_em["stock_code"]
+    out["north_hold_shares"] = df_em.get("hold_shares")
+    out["north_hold_pct"] = df_em.get("hold_pct")
     out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
-
-    logger.info(f"北向持股汇总: {len(out)} 只股票")
+    logger.info(f"北向持股汇总（东财直连备用源）: {len(out)} 只股票")
     return out
 
 

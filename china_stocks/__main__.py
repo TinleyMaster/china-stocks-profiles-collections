@@ -66,7 +66,9 @@ def cmd_init_db() -> None:
                 failed += 1
                 # 截取语句前 80 字方便识别
                 preview = stmt.replace("\n", " ")[:80]
-                logger.warning(f"SQL 语句 #{i} 执行失败（已跳过）: {preview}...  错误: {e}")
+                logger.warning(
+                    f"SQL 语句 #{i} 执行失败（已跳过）: {preview}...  错误: {e}"
+                )
 
     logger.info(f"数据库初始化完成: {db_url()}  (成功 {success} 条, 失败 {failed} 条)")
     if failed > 0:
@@ -359,6 +361,12 @@ def cmd_parse_docs(args) -> None:
         raise
 
 
+def cmd_seed_demo(_args) -> None:
+    from .seed_demo import run_seed_demo
+
+    run_seed_demo()
+
+
 def cmd_web(_args) -> None:
     """独立启动 Web 工作台（无调度器）。"""
     import time
@@ -539,6 +547,7 @@ def main() -> None:
     )
     p_parse.add_argument("--stats", action="store_true", help="查看切块统计信息")
 
+    sub.add_parser("seed-demo", help="填充 demo 示例数据（本地演示/调试用）")
     sub.add_parser("web", help="启动 Web 工作台（独立运行，无调度器）")
 
     args = parser.parse_args()
@@ -568,6 +577,7 @@ def main() -> None:
         "notebook-fill": cmd_notebook_fill,
         "ask": cmd_ask,
         "parse-docs": cmd_parse_docs,
+        "seed-demo": cmd_seed_demo,
         "web": cmd_web,
     }
     dispatch[args.command](args)

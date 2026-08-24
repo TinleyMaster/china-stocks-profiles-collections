@@ -501,6 +501,92 @@ def parse_docs(
 
 
 # ============================================================
+# 3.5 向量化（可选，pgvector + embedding 可用时启用）
+# ============================================================
+
+def _pgvector_available() -> bool:
+    """检查 pgvector 扩展是否已安装。"""
+    try:
+        with get_session() as sess:
+            row = sess.execute(text(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+            )).fetchone()
+            return row is not None
+    except Exception as e:
+        logger.warning(f"检查 pgvector 可用性失败: {e}")
+        return False
+
+
+def embed_pending_chunks(batch_size: int = 100) -> int:
+    """
+    为 doc_chunk 中尚无 embedding 的块生成向量（可选功能）。
+
+    前提：pgvector 已安装 + LLM embedding 可用。
+    不满足时直接返回 0，不报错。
+
+    返回更新的块数。
+    """
+    if not _pgvector_available():
+        logger.info("pgvector 未安装，跳过向量化")
+        return 0
+
+    try:
+        from .llm_client import embed as llm_embed, is_available as llm_available
+    except ImportError:
+        logger.info("LLM 客户端不可用，跳过向量化")
+        return 0
+
+    if not llm_available():
+        logger.info("LLM embedding 不可用，跳过向量化")
+        return 0
+
+    updated = 0
+    while True:
+        with get_session() as sess:
+            rows = sess.execute(text("""
+                SELECT id, chunk_text FROM biz.doc_chunk
+                WHERE embedding IS NULL
+                ORDER BY id
+                LIMIT :bs
+            """), {"bs": batch_size}).fetchall()
+
+        if not rows:
+            break
+
+        chunk_ids = [r.id for r in rows]
+        texts = [r.chunk_text for r in rows]
+
+        try:
+            embeddings = llm_embed(texts)
+        except Exception as e:
+            logger.warning(f"embedding 调用失败: {e}")
+            break
+
+        if not embeddings or len(embeddings) != len(chunk_ids):
+            logger.warning(f"embedding 返回数量不匹配: {len(embeddings)} vs {len(chunk_ids)}")
+            break
+
+        # 批量更新
+        with get_session() as sess:
+            for cid, emb in zip(chunk_ids, embeddings):
+                if not emb:
+                    continue
+                vec_str = "[" + ",".join(str(v) for v in emb) + "]"
+                sess.execute(text("""
+                    UPDATE biz.doc_chunk
+                    SET embedding = :vec::vector
+                    WHERE id = :cid
+                """), {"cid": cid, "vec": vec_str})
+
+        updated += len(chunk_ids)
+        logger.info(f"向量化进度: {updated} 块已更新")
+
+    if updated > 0:
+        logger.info(f"向量化完成: 共更新 {updated} 个块")
+    return updated
+
+
+# ============================================================
 # 4. 统计信息
 # ============================================================
 
@@ -563,13 +649,22 @@ def run_parse_docs(
             doc_types=doc_types,
         )
 
+        # 可选：为新切块生成向量 embedding（pgvector + LLM 可用时执行）
+        embed_count = 0
+        try:
+            embed_count = embed_pending_chunks(batch_size=100)
+            if embed_count > 0:
+                logger.info(f"向量 embedding 生成: {embed_count} 块")
+        except Exception as e:
+            logger.warning(f"向量 embedding 生成失败（不影响主流程）: {e}")
+
         # 三态判定
         status, err_msg = determine_status(
             rows_inserted=docs,
             rows_updated=chunks,
             expected_min_rows=1,
         )
-        finish_run(run, status=status, rows_inserted=docs, rows_updated=chunks, error_msg=err_msg)
+        finish_run(run, status=status, rows_inserted=docs, rows_updated=chunks + embed_count, error_msg=err_msg)
         if status != "success":
             logger.warning(f"文档解析结束，状态: {status}，原因: {err_msg}")
     except Exception as e:

@@ -8,14 +8,16 @@ Phase A：构建股票统一实体
 
 全量跑一次约 5000+ 只股票，建议每日开盘前跑一次。
 """
+
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import pandas as pd
 from sqlalchemy import text
 
-from ..config import WATCHLIST_CODES
+from ..config import MAX_WORKERS, WATCHLIST_CODES
 from ..db import get_session
 from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
@@ -36,21 +38,63 @@ def _detect_market(code: str) -> str:
 def fetch_stock_list() -> pd.DataFrame:
     """获取全 A 股列表（带代码、名称、交易所）。
 
-    优先用东方财富（最全），失败则用新浪接口兜底。
+    数据源优先级：
+      1. 东方财富 stock_zh_a_spot_em（最全，带实时行情）
+      2. 新浪 stock_zh_a_spot（带实时行情，约 5500 只）
+      3. 新浪 stock_info_a_code_name（纯代码+名称，无行情）
+      4. 巨潮 stock_info_sz_name_code + stock_info_sh_name_code（仅深市/沪市）
     """
     last_error = None
-    # 数据源优先级：东方财富 > 新浪
-    for source in ["eastmoney", "sina"]:
+    sources = [
+        "eastmoney_spot",  # 东方财富实时行情
+        "sina_spot",  # 新浪实时行情
+        "sina_code_name",  # 新浪纯名单
+        "cninfo",  # 巨潮资讯（深市+沪市分开取）
+    ]
+    for source in sources:
         try:
-            if source == "eastmoney":
+            if source == "eastmoney_spot":
                 df = ak.call_api("stock_zh_a_spot_em", save_raw=True)
-                if "代码" not in df.columns or "名称" not in df.columns:
+                col_map = _find_columns(
+                    df.columns.tolist(),
+                    {
+                        "code": ["代码"],
+                        "name": ["名称"],
+                    },
+                )
+                if not col_map.get("code") or not col_map.get("name"):
                     raise RuntimeError("stock_zh_a_spot_em 返回字段不符合预期")
                 out = pd.DataFrame()
-                out["stock_code"] = df["代码"].astype(str).str.zfill(6)
-                out["stock_name"] = df["名称"].astype(str)
-            else:  # sina
-                logger.warning("东方财富接口不可用，改用新浪接口 stock_info_a_code_name")
+                out["stock_code"] = df[col_map["code"]].astype(str).str.zfill(6)
+                out["stock_name"] = df[col_map["name"]].astype(str)
+
+            elif source == "sina_spot":
+                logger.warning("东方财富不可用，尝试新浪 stock_zh_a_spot")
+                df = ak.call_api("stock_zh_a_spot", save_raw=True)
+                col_map = _find_columns(
+                    df.columns.tolist(),
+                    {
+                        "code": ["代码", "code", "symbol"],
+                        "name": ["名称", "name"],
+                    },
+                )
+                if not col_map.get("code") or not col_map.get("name"):
+                    raise RuntimeError("stock_zh_a_spot 返回字段不符合预期")
+                out = pd.DataFrame()
+                # 新浪 spot 的代码带 sh/sz/bj 前缀，去掉前缀取后 6 位
+                raw_codes = df[col_map["code"]].astype(str)
+                # 统一去掉 sh/sz/bj 前缀
+                cleaned = raw_codes.str.replace(r"^(sh|sz|bj)", "", regex=True)
+                # 有些可能是 6 位纯数字，先 zfill
+                out["stock_code"] = cleaned.str.zfill(6)
+                out["stock_name"] = df[col_map["name"]].astype(str)
+                # 过滤掉非 6 位数字的
+                out = out[out["stock_code"].str.match(r"^\d{6}$")]
+                # 去重
+                out = out.drop_duplicates(subset=["stock_code"])
+
+            elif source == "sina_code_name":
+                logger.warning("新浪 spot 不可用，尝试新浪 stock_info_a_code_name")
                 df = ak.call_api("stock_info_a_code_name", save_raw=True)
                 out = pd.DataFrame()
                 if "code" in df.columns and "name" in df.columns:
@@ -68,6 +112,7 @@ def fetch_stock_list() -> pd.DataFrame:
                     out["stock_name"] = df[col_map["name"]].astype(str)
 
             out["market"] = out["stock_code"].apply(_detect_market)
+            out = out[out["market"] != "UNKNOWN"]
             out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
             logger.info(f"获取到 {len(out)} 只 A 股（来源: {source}）")
             return out
@@ -118,6 +163,8 @@ def fetch_stock_list() -> pd.DataFrame:
 
 def save_stock_list_to_src(df: pd.DataFrame) -> int:
     """写入 src_akshare.stock_list（先清空再写入快照）。"""
+    if df.empty:
+        raise RuntimeError("股票列表为空，拒绝写入（防止数据被清空）")
     with get_session() as sess:
         sess.execute(text("TRUNCATE TABLE src_akshare.stock_list"))
         # 用 pandas to_sql + multi 批量插入，比 executemany 快 10-100 倍
@@ -286,20 +333,19 @@ def _fetch_sw_l2_list() -> list[tuple[str, str]]:
 def fetch_sw_industry() -> pd.DataFrame:
     """获取申万一级行业成分股 → 股票-行业映射。
 
-    流程：先拿一级行业列表，再逐个行业拉成分股（index_component_sw，申万宏源源，稳定），
+    流程：先拿一级行业列表，再并发逐个行业拉成分股（index_component_sw，申万宏源源，稳定），
     汇总成 stock_code → industry_l1 映射。l2/l3 暂留空。
     """
     l1_list = _fetch_sw_l1_list()
     if not l1_list:
         return pd.DataFrame()
 
-    frames: list[pd.DataFrame] = []
-    for code, name in l1_list:
+    def _fetch_one(code: str, name: str) -> pd.DataFrame | None:
         try:
             cons = ak.call_api("index_component_sw", save_raw=False, symbol=code)
             if cons.empty:
-                logger.warning(f"申万一级行业 {code} {name} 无成分股")
-                continue
+                logger.debug(f"申万一级行业 {code} {name} 无成分股")
+                return None
 
             col_map = _find_columns(cons.columns.tolist(), {
                 "code": ["证券代码", "股票代码", "代码", "code"],
@@ -307,7 +353,7 @@ def fetch_sw_industry() -> pd.DataFrame:
             })
             if not col_map.get("code"):
                 logger.warning(f"申万一级行业 {code} {name} 字段无法识别: {list(cons.columns)}")
-                continue
+                return None
 
             sub = pd.DataFrame()
             sub["stock_code"] = cons[col_map["code"]].astype(str).str.zfill(6)
@@ -319,9 +365,23 @@ def fetch_sw_industry() -> pd.DataFrame:
             sub["industry_l1"] = name
             sub["industry_l2"] = None
             sub["industry_l3"] = None
-            frames.append(sub)
+            return sub
         except Exception as e:
             logger.warning(f"申万一级行业 {code} {name} 成分股拉取失败: {e}")
+            return None
+
+    frames: list[pd.DataFrame] = []
+    workers = min(MAX_WORKERS, 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, c, n): (c, n) for c, n in l1_list}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            result = fut.result()
+            if result is not None and not result.empty:
+                frames.append(result)
+            if done % 10 == 0:
+                logger.info(f"申万行业进度: {done}/{len(l1_list)}")
 
     if not frames:
         return pd.DataFrame()
@@ -370,6 +430,7 @@ def save_sw_industry_to_src(df: pd.DataFrame) -> int:
 def refresh_core_stock() -> tuple[int, int]:
     """
     以 src 层为数据源，刷新 core.stock 统一实体表。
+    使用批量 INSERT ... ON CONFLICT，性能远好于逐行判断。
     返回 (inserted, updated)。
     """
     with get_session() as sess:
@@ -421,11 +482,13 @@ def refresh_core_stock() -> tuple[int, int]:
             """)
         )
 
-    logger.info(f"core.stock 更新完成: 新增 {inserted}, 更新 {updated}")
-    return inserted, updated
+    logger.info(f"core.stock 更新完成: 共 {len(rows)} 条（批量 upsert）")
+    return 0, len(rows)
 
 
-def get_stock_codes(limit: Optional[int] = None, only_watchlist: bool = False) -> list[str]:
+def get_stock_codes(
+    limit: Optional[int] = None, only_watchlist: bool = False
+) -> list[str]:
     """
     获取需要采集的股票代码列表。
 
@@ -437,7 +500,9 @@ def get_stock_codes(limit: Optional[int] = None, only_watchlist: bool = False) -
     else:
         with get_session() as sess:
             rows = sess.execute(
-                text("SELECT stock_code FROM core.stock WHERE is_delisted = FALSE ORDER BY stock_code")
+                text(
+                    "SELECT stock_code FROM core.stock WHERE is_delisted = FALSE ORDER BY stock_code"
+                )
             ).fetchall()
             codes = [r[0] for r in rows]
 
@@ -446,10 +511,10 @@ def get_stock_codes(limit: Optional[int] = None, only_watchlist: bool = False) -
     return codes
 
 
-def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 100) -> int:
+def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 200) -> int:
     """批量更新 core.stock.list_date（上市日期）。
 
-    使用 akshare 的 stock_individual_info_em 接口逐只拉取，
+    使用 akshare 的 stock_individual_info_em 接口并发拉取，
     避免 stock_zh_a_spot_em 无 list_date 字段的问题。
     返回更新行数。
     """
@@ -458,34 +523,47 @@ def update_list_date(codes: Optional[list[str]] = None, flush_every: int = 100) 
 
     updated = 0
     results: list[dict] = []
-    logger.info(f"开始更新上市日期: {len(codes)} 只股票")
+    logger.info(f"开始更新上市日期: {len(codes)} 只股票（并发 {min(MAX_WORKERS, 10)} 线程）")
 
-    for i, code in enumerate(codes, 1):
-        ld = ak.fetch_list_date(code)
-        if ld:
-            results.append({"stock_code": code, "list_date": ld})
-        if i % 100 == 0:
-            logger.info(f"上市日期进度: {i}/{len(codes)}, 已获取 {len(results)}")
+    def _fetch_one(code: str) -> tuple[str, str | None]:
+        try:
+            ld = ak.fetch_list_date(code)
+            return code, ld
+        except Exception:
+            return code, None
 
-        if len(results) >= flush_every:
-            df = pd.DataFrame(results)
-            with get_session() as sess:
-                conn = sess.connection()
-                df.to_sql(
-                    "tmp_list_date", conn, schema="core",
-                    if_exists="replace", index=False, method="multi", chunksize=1000,
-                )
-                r = sess.execute(text("""
-                    UPDATE core.stock s
-                    SET list_date = CAST(t.list_date AS date),
-                        updated_at = NOW()
-                    FROM core.tmp_list_date t
-                    WHERE s.stock_code = t.stock_code
-                      AND s.list_date IS DISTINCT FROM CAST(t.list_date AS date)
-                """))
-                updated += r.rowcount
-                sess.execute(text("DROP TABLE IF EXISTS core.tmp_list_date"))
-            results = []
+    workers = min(MAX_WORKERS, 10)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, c): c for c in codes}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            code, ld = fut.result()
+            if ld:
+                results.append({"stock_code": code, "list_date": ld})
+
+            if done % 500 == 0:
+                logger.info(f"上市日期进度: {done}/{len(codes)}, 已获取 {len(results)}")
+
+            if len(results) >= flush_every:
+                df = pd.DataFrame(results)
+                with get_session() as sess:
+                    conn = sess.connection()
+                    df.to_sql(
+                        "tmp_list_date", conn, schema="core",
+                        if_exists="replace", index=False, method="multi", chunksize=1000,
+                    )
+                    r = sess.execute(text("""
+                        UPDATE core.stock s
+                        SET list_date = CAST(t.list_date AS date),
+                            updated_at = NOW()
+                        FROM core.tmp_list_date t
+                        WHERE s.stock_code = t.stock_code
+                          AND s.list_date IS DISTINCT FROM CAST(t.list_date AS date)
+                    """))
+                    updated += r.rowcount
+                    sess.execute(text("DROP TABLE IF EXISTS core.tmp_list_date"))
+                results = []
 
     # 末尾剩余批次
     if results:

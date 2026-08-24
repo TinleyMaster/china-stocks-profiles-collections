@@ -62,13 +62,44 @@ def _get_openai_client():
 
 
 def is_available() -> bool:
-    """检查 LLM 是否可用。"""
+    """检查真实 LLM 是否可用（mock 模式返回 False，避免误导）。
+
+    mock 模式只是占位响应，不具备真实问答能力，上层应明确告知用户。
+    """
     provider = _get_provider()
     if provider == "mock":
-        return True
+        return False
     if provider == "openai_compatible":
         return _get_openai_client() is not None
     return False
+
+
+def get_provider_info() -> dict:
+    """获取当前 LLM 配置信息，供前端展示用。
+
+    返回:
+        {
+            "provider": "mock" | "openai_compatible" | ...,
+            "available": bool,  # 真实可用才为 True
+            "model": str,
+            "has_embedding": bool,
+        }
+    """
+    provider = _get_provider()
+    available = is_available()
+    model = _get_model() if available else "mock-model"
+
+    has_embedding = False
+    if provider == "openai_compatible" and available:
+        embed_model = _get_env("LLM_EMBEDDING_MODEL", "")
+        has_embedding = bool(embed_model)
+
+    return {
+        "provider": provider,
+        "available": available,
+        "model": model,
+        "has_embedding": has_embedding,
+    }
 
 
 def chat_completion(

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timedelta
 from io import StringIO
@@ -14,10 +15,18 @@ from typing import Any, Callable
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from ..logging_setup import logger
 from ..raw.storage import save_raw_response
+
+# 强制绕过系统代理 — 很多本地环境有挂掉的代理（如 Clash 未启动），
+# 导致 requests 自动走代理然后全部失败。国内财经网站直连即可。
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+# 清除代理变量，防止 akshare 内部的 requests 走代理
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.pop(_k, None)
 
 # 抑制 pandas 对 object dtype 列 ffill 的 FutureWarning（新浪股东/财务解析大量触发）
 pd.set_option("future.no_silent_downcasting", True)
@@ -35,10 +44,38 @@ def _get_ak():
     return _ak
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """判断异常是否可重试。
+
+    覆盖：网络层（连接重置/超时/拒绝/SSL错误）、HTTP 5xx、akshare 内部偶发异常。
+    不重试：明确的业务错误（如参数错误、404）。
+    """
+    import ssl
+
+    retryable_types = (
+        ConnectionError,
+        ConnectionResetError,
+        ConnectionRefusedError,
+        TimeoutError,
+        OSError,  # 包含 ECONNRESET / ETIMEDOUT 等底层 socket 错误
+        ssl.SSLError,
+    )
+    if isinstance(exc, retryable_types):
+        return True
+    # 某些 akshare 接口把网络异常包成 RuntimeError / Exception
+    msg = str(exc).lower()
+    retryable_keywords = (
+        "connection", "reset", "timeout", "timed out", "refused",
+        "ssl", "eof", "network", "502", "503", "504", "500",
+        "server error", "temporarily", "too many requests",
+    )
+    return any(kw in msg for kw in retryable_keywords)
+
+
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError, RuntimeError)),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=15),
+    retry=retry_if_exception(_is_retryable),
     reraise=True,
 )
 def call_api(api_name: str, save_raw: bool = True, **kwargs) -> pd.DataFrame:
@@ -705,6 +742,82 @@ def fetch_pledge_pct(symbol: str) -> float | None:
         return None
 
 
+def fetch_all_pledge_pct(save_raw: bool = True) -> pd.DataFrame:
+    """全市场股权质押比例批量拉取（东财数据中心，自研直连）。
+
+    替代逐只调用 stock_pledge_stock_em（5500 只 × 1 次 = 太慢），
+    东财质押排名接口分页拉取全市场，一次返回几千只，秒级完成。
+
+    返回 DataFrame 列：stock_code, stock_name, pledge_pct
+    """
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    base_params = {
+        "sortColumns": "PLEDGE_RATIO",
+        "sortTypes": "-1",
+        "pageSize": "500",
+        "pageNumber": "1",
+        "reportName": "RPT_CUSTOM_STOCKPLEDGEDETAIL",
+        "columns": "ALL",
+        "source": "WEB",
+        "client": "WEB",
+    }
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": BROWSER_UA})
+
+    rows: list[dict] = []
+    try:
+        first = _em_get_json(sess, url, base_params)
+        res = first.get("result") or {}
+        total_pages = int(res.get("pages", 1) or 1)
+        pages_data = [res.get("data") or []]
+
+        for pg in range(2, min(total_pages, 50) + 1):  # 上限 50 页 = 25000 只，足够
+            p = {**base_params, "pageNumber": str(pg)}
+            try:
+                j2 = _em_get_json(sess, url, p)
+                pages_data.append((j2.get("result") or {}).get("data") or [])
+            except Exception as e:
+                logger.warning(f"质押比例分页拉取失败 page={pg}: {e}")
+                break
+
+        for pg_data in pages_data:
+            for rec in pg_data:
+                code = str(rec.get("SECURITY_CODE") or "").strip()
+                name = str(rec.get("SECURITY_NAME_ABBR") or "").strip()
+                pledge_ratio = rec.get("PLEDGE_RATIO")
+                if not code or not code.isdigit():
+                    continue
+                rows.append({
+                    "stock_code": code.zfill(6),
+                    "stock_name": name,
+                    "pledge_pct": pledge_ratio,
+                })
+    except Exception as e:
+        logger.warning(f"全市场质押比例拉取失败: {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["pledge_pct"] = pd.to_numeric(df["pledge_pct"], errors="coerce")
+    df = df.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="eastmoney",
+                api_name="stock_pledge_all_em",
+                params={"total": len(df)},
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:
+            logger.warning(f"保存质押比例 raw 响应失败: {e}")
+
+    logger.info(f"全市场质押比例拉取: {len(df)} 只")
+    return df
+
+
 def fetch_financial_report(
     symbol: str,
     save_raw: bool = True,
@@ -796,3 +909,91 @@ def fetch_list_date(symbol: str) -> str | None:
     except Exception as e:
         logger.debug(f"{symbol} 上市日期拉取失败: {e}")
     return None
+
+
+# ============================================================
+# 北向资金持股（东财数据中心自研直连，备用源）
+# ============================================================
+
+def fetch_north_holdings_em(save_raw: bool = True) -> pd.DataFrame:
+    """全市场北向资金持股明细（东财数据中心，自研直连，备用源）。
+
+    2024-08 后港交所停止实时披露，akshare 的 stock_hsgt_hold_stock_em
+    可能返回空。此函数直接调用东财数据中心的沪深港通持股接口，
+    作为备用数据源，拉取沪股通 + 深股通合并数据。
+
+    返回 DataFrame 列：stock_code, stock_name, hold_shares, hold_pct, hold_amount
+    """
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    base_params = {
+        "sortColumns": "HOLD_MARKET_CAP",
+        "sortTypes": "-1",
+        "pageSize": "500",
+        "pageNumber": "1",
+        "reportName": "RPT_MUTUAL_STOCK_HOLDSTAT",
+        "columns": "ALL",
+        "source": "WEB",
+        "client": "WEB",
+        # 1=沪股通, 2=深股通, 3=港股通(沪), 4=港股通(深)
+        # 这里只拉北向：沪股通 + 深股通
+        "filter": "(MUTUAL_TYPE=\"1\")(MUTUAL_TYPE=\"2\")",
+    }
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": BROWSER_UA})
+
+    rows: list[dict] = []
+    try:
+        first = _em_get_json(sess, url, base_params)
+        res = first.get("result") or {}
+        total_pages = int(res.get("pages", 1) or 1)
+        pages_data = [res.get("data") or []]
+
+        # 上限 20 页 = 10000 只，足够覆盖全市场
+        for pg in range(2, min(total_pages, 20) + 1):
+            p = {**base_params, "pageNumber": str(pg)}
+            try:
+                j2 = _em_get_json(sess, url, p)
+                pages_data.append((j2.get("result") or {}).get("data") or [])
+            except Exception as e:
+                logger.warning(f"北向持股分页拉取失败 page={pg}: {e}")
+                break
+
+        for pg_data in pages_data:
+            for rec in pg_data:
+                code = str(rec.get("SECURITY_CODE") or "").strip()
+                name = str(rec.get("SECURITY_NAME_ABBR") or "").strip()
+                if not code or not code.isdigit():
+                    continue
+                rows.append({
+                    "stock_code": code.zfill(6),
+                    "stock_name": name,
+                    "hold_shares": rec.get("HOLD_SHARES"),
+                    "hold_pct": rec.get("HOLD_SHARES_RATIO"),
+                    "hold_amount": rec.get("HOLD_MARKET_CAP"),
+                })
+    except Exception as e:
+        logger.warning(f"全市场北向持股拉取失败: {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    for col in ["hold_shares", "hold_pct", "hold_amount"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+
+    if save_raw:
+        try:
+            save_raw_response(
+                platform_code="eastmoney",
+                api_name="north_holdings_all_em",
+                params={"total": len(df)},
+                response=df.to_dict(orient="records"),
+            )
+        except Exception as e:
+            logger.warning(f"保存北向持股 raw 响应失败: {e}")
+
+    logger.info(f"全市场北向持股拉取（东财直连）: {len(df)} 只")
+    return df

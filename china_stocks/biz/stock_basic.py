@@ -6,12 +6,14 @@ biz 层：stock_basic 画像构建（最新行情 + 估值）
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
 from sqlalchemy import text
 
+from ..config import MAX_WORKERS
 from ..db import get_session
 from ..logging_setup import logger
 from ..sys import determine_status, finish_run, start_run
@@ -186,12 +188,15 @@ def _load_close_prices() -> dict[str, float]:
 
 
 def fetch_and_save_dividend(codes: list[str], flush_every: int = 200) -> int:
-    """批量采集股息率 dv_ttm（P2-4 修复）。
+    """批量采集股息率 dv_ttm（并发优化版）。
 
-    逐只股票获取最新已实施现金分红（每10股派息），
+    并发采集每只股票的最新已实施现金分红（每10股派息），
     结合 biz.stock_basic 的最新收盘价计算股息率：
         dv_ttm(%) = (每10股派息 / 10) / 收盘价 × 100
     写入 biz.stock_basic.dv_ttm。
+
+    并发策略：ThreadPoolExecutor，默认 MAX_WORKERS 线程，
+    5500 只从串行数小时降到分钟级，避免任务超时被截断。
 
     去静默：统计 failed（接口/解析异常）与 skipped（无分红/无价），
     并在日志中明确反映，不再用 blanket try/except 吞掉整个采集。
@@ -202,42 +207,59 @@ def fetch_and_save_dividend(codes: list[str], flush_every: int = 200) -> int:
     skipped = 0
 
     price_map = _load_close_prices()
-    logger.info(f"开始采集股息率: {len(codes)} 只股票, 其中有收盘价 {len(price_map)} 只")
+    logger.info(
+        f"开始采集股息率: {len(codes)} 只股票, "
+        f"有收盘价 {len(price_map)} 只, 并发 {MAX_WORKERS} 线程"
+    )
 
-    for i, code in enumerate(codes, 1):
+    def _fetch_one(code: str) -> tuple[str, float | None, str | None]:
+        """单只股票股息率采集，返回 (code, dv_ttm_or_None, error_or_None)。"""
         try:
             cash_per_10 = ak.fetch_cash_dividend_per_10(symbol=code)
-        except Exception as e:  # noqa: BLE001 - 真实异常需留痕
-            failed += 1
-            logger.warning(f"{code} 股息率采集异常: {e}")
-            continue
+        except Exception as e:  # noqa: BLE001
+            return code, None, str(e)
 
         if cash_per_10 is None:
-            skipped += 1
-            continue
+            return code, None, None  # 无分红
 
         price = price_map.get(code)
         if not price or price <= 0:
-            skipped += 1
-            continue
+            return code, None, None  # 无价跳过
 
         div_per_share = cash_per_10 / 10.0
         dv_ttm = round(div_per_share / price * 100, 4)
-        results.append({"stock_code": code, "dv_ttm": dv_ttm})
+        return code, dv_ttm, None
 
-        if i % 500 == 0:
-            logger.info(f"股息率进度: {i}/{len(codes)}")
+    completed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, code): code for code in codes}
+        for fut in as_completed(futures):
+            code, dv_ttm, err = fut.result()
+            completed += 1
+            if err:
+                failed += 1
+                logger.debug(f"{code} 股息率采集异常: {err}")
+            elif dv_ttm is None:
+                skipped += 1
+            else:
+                results.append({"stock_code": code, "dv_ttm": dv_ttm})
 
-        if len(results) >= flush_every:
-            total += _batch_update_dividend(results)
-            results = []
+            if completed % 500 == 0:
+                logger.info(f"股息率进度: {completed}/{len(codes)}")
+
+            if len(results) >= flush_every:
+                total += _batch_update_dividend(results)
+                results = []
 
     if results:
         total += _batch_update_dividend(results)
 
     # 去静默：明确汇报成功/跳过/异常
     level = logger.warning if failed > 0 else logger.info
-    level(f"股息率采集完成: 写入 {total} 只, 无分红/无价跳过 {skipped} 只, 异常 {failed} 只")
+    level(
+        f"股息率采集完成: 写入 {total} 只, "
+        f"无分红/无价跳过 {skipped} 只, 异常 {failed} 只"
+    )
     return total
 
 

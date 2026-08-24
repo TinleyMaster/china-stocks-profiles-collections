@@ -62,11 +62,11 @@ def send_alert(subject: str, body: str) -> None:
         logger.warning(f"发送告警邮件失败: {e}")
 
 
-def run_with_alert(job_name: str, func) -> None:
+def run_with_alert(job_name: str, func, *args, **kwargs) -> None:
     """包装任务函数，失败发邮件。"""
     try:
         logger.info(f"[调度] 开始执行: {job_name}")
-        func()
+        func(*args, **kwargs)
         logger.info(f"[调度] 执行完成: {job_name}")
     except Exception as e:
         tb = traceback.format_exc()
@@ -90,7 +90,7 @@ def build_scheduler() -> BlockingScheduler:
     from .biz.capital_snapshot import run_capital_snapshot
     from .biz.shareholder_snapshot import run_shareholder_snapshot
     from .biz.research_notebook import run_build_notebooks
-    from .biz.doc_parser import run_parse_docs
+    from .biz.doc_parser import run_parse_docs, embed_pending_chunks
     from .src.phase_d_events import run_corporate_events
 
     # 每日 08:30 — 股票池 + 行业刷新
@@ -174,20 +174,29 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1,
     )
 
-    # 每周二至六 02:00 — 公告 PDF 下载（夜间闲时跑，避免高峰）
+    # 每日 02:00 — 公告 PDF 下载（夜间闲时跑，每次上限 2000 条防超时）
     scheduler.add_job(
-        lambda: run_with_alert("Phase B2-公告下载", run_download_announcements),
-        CronTrigger(day_of_week="tue,sat", hour=2, minute=0, timezone=TIMEZONE),
+        lambda: run_with_alert("Phase B2-公告下载", run_download_announcements, limit=2000),
+        CronTrigger(day_of_week="mon-sun", hour=2, minute=0, timezone=TIMEZONE),
         id="phase_b2_download",
         misfire_grace_time=86400,
         max_instances=1,
     )
 
-    # 每周二至六 03:00 — 文档解析切块（下载完之后马上解析，供 RAG 用）
+    # 每日 03:00 — 文档解析切块（下载完之后马上解析，供 RAG 用）
     scheduler.add_job(
         lambda: run_with_alert("Phase B-文档解析", run_parse_docs),
-        CronTrigger(day_of_week="tue,sat", hour=3, minute=0, timezone=TIMEZONE),
+        CronTrigger(day_of_week="mon-sun", hour=3, minute=0, timezone=TIMEZONE),
         id="phase_b_parse",
+        misfire_grace_time=86400,
+        max_instances=1,
+    )
+
+    # 每日 04:30 — 文档切块向量 embedding 补全（pgvector+LLM 可用时执行，处理历史积压）
+    scheduler.add_job(
+        lambda: run_with_alert("Phase B-向量Embedding补全", embed_pending_chunks, batch_size=200),
+        CronTrigger(day_of_week="mon-sun", hour=4, minute=30, timezone=TIMEZONE),
+        id="phase_b_embed",
         misfire_grace_time=86400,
         max_instances=1,
     )
@@ -201,10 +210,10 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1,
     )
 
-    # 每周三 03:00 — 公司事件采集
+    # 每周一/三/五 04:00 — 公司事件采集（事件驱动投研核心数据，多频补全）
     scheduler.add_job(
         lambda: run_with_alert("Phase D-公司事件", run_corporate_events),
-        CronTrigger(day_of_week="wed", hour=3, minute=0, timezone=TIMEZONE),
+        CronTrigger(day_of_week="mon,wed,fri", hour=4, minute=0, timezone=TIMEZONE),
         id="phase_d_events",
         misfire_grace_time=86400,
         max_instances=1,

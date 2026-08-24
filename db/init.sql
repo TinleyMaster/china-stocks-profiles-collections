@@ -14,6 +14,14 @@
 -- 0. 扩展
 -- ============================================================
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- pgvector 向量扩展（可选，未安装时跳过）
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS "vector";
+EXCEPTION
+    WHEN undefined_file THEN
+        RAISE NOTICE 'pgvector 扩展未安装，向量检索功能将不可用';
+END $$;
 
 -- ============================================================
 -- 1. sys —— 系统元数据
