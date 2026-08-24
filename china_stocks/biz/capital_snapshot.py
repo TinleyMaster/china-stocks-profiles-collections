@@ -31,13 +31,53 @@ from .stock_basic import _last_trading_day
 # 1. 北向资金
 # ============================================================
 
+def _extract_north_from_top10() -> pd.DataFrame:
+    """从十大流通股东中提取香港中央结算有限公司持股（北向资金近似值）。
+
+    2024-08 后港交所停止每日实时披露，akshare 北向持股接口可能无数据。
+    作为兜底方案，从 biz.shareholder_snapshot.top10_json 中提取
+    "香港中央结算有限公司"的持股比例，作为北向持股的季度近似值。
+
+    返回 DataFrame 列：stock_code, north_hold_shares, north_hold_pct, report_date
+    """
+    with get_session() as sess:
+        rows = sess.execute(text("""
+            SELECT
+                s.stock_code,
+                s.report_date,
+                h->>'name' AS holder_name,
+                (h->>'hold_shares')::float AS hold_shares,
+                (h->>'hold_pct')::float AS hold_pct
+            FROM biz.shareholder_snapshot s,
+                 jsonb_array_elements(s.top10_json->'top10_holders') AS h
+            WHERE h->>'name' LIKE '%香港中央结算%'
+              AND s.report_date = (
+                  SELECT MAX(report_date) FROM biz.shareholder_snapshot s2
+                  WHERE s2.stock_code = s.stock_code
+              )
+        """)).fetchall()
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame([{
+        "stock_code": r[0],
+        "report_date": r[1],
+        "north_hold_shares": r[3],
+        "north_hold_pct": r[4],
+    } for r in rows])
+    df = df.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
+    logger.info(f"北向持股（十大流通股东兜底）: {len(df)} 只")
+    return df
+
+
 def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
     """
     获取北向资金最新持股明细（沪股通 + 深股通合并）。
 
     主源：akshare 接口 stock_hsgt_hold_stock_em（按市场分开，这里合并）
-    备用源：东财数据中心自研直连 fetch_north_holdings_em（2024-08 港交所停止
-           实时披露后，akshare 接口可能返回空，此时自动降级到备用源）
+    兜底源：从十大流通股东中提取香港中央结算有限公司持股（季度近似值）
+           （2024-08 港交所停止实时披露后，akshare 接口可能返回空）
     """
     # ── 主源：akshare 沪深港通持股 ──
     all_dfs = []
@@ -80,24 +120,24 @@ def fetch_north_holdings(trade_date: Optional[str] = None) -> pd.DataFrame:
             return out
         logger.warning("北向持股返回字段异常，找不到股票代码列")
 
-    # ── 备用源：东财数据中心自研直连 ──
-    logger.info("akshare 北向持股无数据，尝试东财数据中心备用源")
+    # ── 兜底源：从十大流通股东提取香港中央结算持股 ──
+    logger.info("akshare 北向持股无数据，尝试从十大流通股东提取兜底数据")
     try:
-        df_em = ak.fetch_north_holdings_em(save_raw=True)
+        df_top10 = _extract_north_from_top10()
     except Exception as e:
-        logger.warning(f"东财直连北向持股拉取失败: {e}")
+        logger.warning(f"十大流通股东兜底提取失败: {e}")
         return pd.DataFrame()
 
-    if df_em.empty:
-        logger.warning("东财直连北向持股也无数据")
+    if df_top10.empty:
+        logger.warning("十大流通股东兜底也无数据（shareholder_snapshot 可能未采集）")
         return pd.DataFrame()
 
     out = pd.DataFrame()
-    out["stock_code"] = df_em["stock_code"]
-    out["north_hold_shares"] = df_em.get("hold_shares")
-    out["north_hold_pct"] = df_em.get("hold_pct")
+    out["stock_code"] = df_top10["stock_code"].astype(str).str.zfill(6)
+    out["north_hold_shares"] = df_top10.get("north_hold_shares")
+    out["north_hold_pct"] = df_top10.get("north_hold_pct")
     out = out.drop_duplicates(subset=["stock_code"]).reset_index(drop=True)
-    logger.info(f"北向持股汇总（东财直连备用源）: {len(out)} 只股票")
+    logger.info(f"北向持股汇总（十大流通股东兜底）: {len(out)} 只股票")
     return out
 
 
